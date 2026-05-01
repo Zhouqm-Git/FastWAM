@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .advantages import (
-    compute_gspo_block_advantages,
     compute_gspo_trajectory_advantages,
     compute_gspo_trajectory_decay_advantages,
 )
@@ -23,12 +22,6 @@ class FlowGSPOVariant:
 
 
 FLOW_GSPO_VARIANTS: dict[str, FlowGSPOVariant] = {
-    "block": FlowGSPOVariant(
-        name="block",
-        advantage_mode="block",
-        ratio_mode="chunk",
-        description="Original Flow-GSPO: block-level advantage with chunk-level ratio.",
-    ),
     "traj_chunk": FlowGSPOVariant(
         name="traj_chunk",
         advantage_mode="trajectory",
@@ -63,9 +56,6 @@ def assign_advantages(
 ) -> None:
     """Assign advantages according to the configured ablation variant."""
     spec = resolve_variant(variant)
-    if spec.advantage_mode == "block":
-        compute_gspo_block_advantages(buffer=buffer, gamma=gamma)
-        return
 
     assignment = str(trajectory_assignment).strip().lower()
     if assignment == "uniform":

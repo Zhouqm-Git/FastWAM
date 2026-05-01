@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from hydra.utils import instantiate
@@ -61,6 +64,33 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     logger.info("Loaded RL initialization checkpoint: %s", ckpt)
 
 
+def _get_rng_state() -> dict:
+    """Capture full RNG state for CPU, NumPy, Python random, and CUDA.
+
+    Follows RLinf's ``Checkpoint.state_dict()`` pattern so that resume
+    restores the *exact* random stream, not just the base seed.
+    """
+    state: dict[str, Any] = {
+        "cpu": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "random": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state: dict) -> None:
+    """Restore all RNG generators from a previously captured state."""
+    torch.set_rng_state(state["cpu"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "random" in state:
+        random.setstate(state["random"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 class FastWAMRLTrainer:
     """Single-node Flow-GSPO trainer with clean ablation switches."""
 
@@ -92,6 +122,7 @@ class FastWAMRLTrainer:
         self.task_cursor = 0
         self._task_state_cursors: dict[int, int] = {}
         self._task_runtime_cache: dict[int, dict[str, Any]] = {}
+        self._saved_sample_counters: dict[int, int] = {}
 
         self.accelerator = Accelerator(mixed_precision=self.mixed_precision)
         if self.accelerator.num_processes != 1:
@@ -241,6 +272,15 @@ class FastWAMRLTrainer:
             input_w=input_w,
             model_device=str(self.accelerator.unwrap_model(self.model).device),
         )
+        # Restore sample counter so that resumed rollouts continue the
+        # seed sequence rather than replaying seeds from the beginning.
+        if task_id in self._saved_sample_counters:
+            collector._sample_counter = self._saved_sample_counters.pop(task_id)
+            logger.info(
+                "Restored collector sample counter for task %d: %d",
+                task_id,
+                collector._sample_counter,
+            )
         runtime = {
             "task_description": task_description,
             "initial_states": initial_states,
@@ -291,12 +331,18 @@ class FastWAMRLTrainer:
             buffer.extend(task_buffer)
         return buffer
 
-    def _training_state_payload(self) -> dict[str, Any]:
+    def _training_state_payload(self, weights_path: str = "") -> dict[str, Any]:
+        collector_sample_counters: dict[str, int] = {}
+        for task_id, runtime in self._task_runtime_cache.items():
+            collector_sample_counters[str(task_id)] = runtime["collector"]._sample_counter
         return {
             "global_step": int(self.global_step),
             "task_cursor": int(self.task_cursor),
             "task_state_cursors": {str(k): int(v) for k, v in self._task_state_cursors.items()},
             "variant": self.variant.name,
+            "weights_path": weights_path,
+            "collector_sample_counters": collector_sample_counters,
+            "rng_state": _get_rng_state(),
         }
 
     def _save_weights_checkpoint(self, step_tag: str) -> str:
@@ -313,7 +359,7 @@ class FastWAMRLTrainer:
         torch.save(
             {
                 "optimizer": self.optimizer.state_dict(),
-                "trainer_state": self._training_state_payload(),
+                "trainer_state": self._training_state_payload(weights_path=weights_path),
             },
             os.path.join(state_path, "trainer_state.pt"),
         )
@@ -326,7 +372,7 @@ class FastWAMRLTrainer:
         state_file = resume_dir / "trainer_state.pt"
         if not state_file.exists():
             raise FileNotFoundError(f"RL resume state not found: {state_file}")
-        payload = torch.load(state_file, map_location="cpu")
+        payload = torch.load(state_file, map_location="cpu", weights_only=False)
         self.optimizer.load_state_dict(payload["optimizer"])
         trainer_state = payload["trainer_state"]
         self.global_step = int(trainer_state.get("global_step", 0))
@@ -334,6 +380,46 @@ class FastWAMRLTrainer:
         self._task_state_cursors = {
             int(k): int(v) for k, v in trainer_state.get("task_state_cursors", {}).items()
         }
+
+        # ---- Restore model weights (Fix #1) ----
+        # The init checkpoint was loaded earlier; replace with the
+        # weights that correspond to the resumed training step.
+        weights_path = trainer_state.get("weights_path", "")
+        if weights_path and os.path.isfile(weights_path):
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            unwrapped.load_checkpoint(weights_path)
+            logger.info("Resumed model weights from %s", weights_path)
+        else:
+            # Fallback: locate weights by step-tag naming convention.
+            step_tag = f"update_{self.global_step:06d}"
+            fallback = os.path.join(self.weights_dir, f"{step_tag}.pt")
+            if os.path.isfile(fallback):
+                unwrapped = self.accelerator.unwrap_model(self.model)
+                unwrapped.load_checkpoint(fallback)
+                logger.info("Resumed model weights from fallback %s", fallback)
+            else:
+                logger.warning(
+                    "Resume weights_path missing or invalid (%s), "
+                    "fallback %s also absent.  Model weights come from "
+                    "the init checkpoint and may be stale.",
+                    weights_path,
+                    fallback,
+                )
+
+        # ---- Restore RNG state (Fix #2, part 1) ----
+        rng_state = trainer_state.get("rng_state")
+        if rng_state is not None:
+            _set_rng_state(rng_state)
+            logger.info("Restored RNG state from checkpoint.")
+
+        # ---- Cache collector sample counters (Fix #2, part 2) ----
+        # Collectors are lazily created; counters are applied in
+        # _get_task_runtime when each collector is first built.
+        self._saved_sample_counters = {
+            int(k): int(v)
+            for k, v in trainer_state.get("collector_sample_counters", {}).items()
+        }
+
         logger.info("Resumed RL trainer from %s at update=%d", resume_dir, self.global_step)
 
     def _log_metrics(self, rollout_metrics: dict[str, float], train_metrics: dict[str, float]) -> None:
@@ -344,8 +430,12 @@ class FastWAMRLTrainer:
 
     def train(self) -> None:
         logger.info("Starting FastWAM RL training for %d updates.", self.max_updates)
+
         while self.global_step < self.max_updates:
+            t_rollout = time.perf_counter()
             rollout_buffer = self._collect_rollout_buffer()
+            rollout_time = time.perf_counter() - t_rollout
+
             assign_advantages(
                 rollout_buffer,
                 variant=self.variant.name,
@@ -354,11 +444,14 @@ class FastWAMRLTrainer:
             )
             rollout_metrics = compute_rollout_metrics(rollout_buffer)
 
+            t_optim = time.perf_counter()
             unwrapped_model = self.accelerator.unwrap_model(self.model)
             train_metrics = {
                 "variant_chunk_ratio": 1.0 if self.variant.ratio_mode == "chunk" else 0.0,
                 "variant_trajectory_ratio": 1.0 if self.variant.ratio_mode == "trajectory" else 0.0,
             }
+            # Accumulate metrics across epochs, then average
+            epoch_accum: dict[str, list[float]] = {}
             for _ in range(self.num_optimization_epochs):
                 result = compute_gspo_objective(
                     model=unwrapped_model,
@@ -382,26 +475,37 @@ class FastWAMRLTrainer:
                         self.max_grad_norm,
                     )
                     self.optimizer.step()
-                    train_metrics["grad_norm"] = float(grad_norm)
+                    epoch_accum.setdefault("grad_norm", []).append(float(grad_norm))
                 else:
-                    train_metrics["grad_norm"] = 0.0
-                train_metrics.update(result.metrics)
+                    epoch_accum.setdefault("grad_norm", []).append(0.0)
+                for k, v in result.metrics.items():
+                    epoch_accum.setdefault(k, []).append(float(v))
+
+            optim_time = time.perf_counter() - t_optim
+
+            # Average epoch metrics
+            for k, vals in epoch_accum.items():
+                train_metrics[k] = sum(vals) / len(vals)
+            train_metrics["rollout_time_s"] = rollout_time
+            train_metrics["optim_time_s"] = optim_time
 
             self.global_step += 1
 
             if self.log_every > 0 and self.global_step % self.log_every == 0:
                 self._log_metrics(rollout_metrics=rollout_metrics, train_metrics=train_metrics)
                 logger.info(
-                    "[rl] update=%d/%d variant=%s success_rate=%.3f num_traj=%d num_chunks=%d loss=%.4f clip_frac=%.3f approx_kl=%.5f",
+                    "[rl] update=%d/%d variant=%s success_rate=%.3f num_traj=%d num_chunks=%d "
+                    "clip_frac=%.3f approx_kl=%.5f rollout=%.1fs optim=%.1fs",
                     self.global_step,
                     self.max_updates,
                     self.variant.name,
                     rollout_metrics["success_rate"],
                     int(rollout_metrics["num_trajectories"]),
                     int(rollout_metrics["num_chunks"]),
-                    float(result.loss.detach().item()) if result.metrics["num_objective_terms"] > 0 else 0.0,
                     train_metrics["clip_fraction"],
                     train_metrics["approx_kl"],
+                    rollout_time,
+                    optim_time,
                 )
 
             if self.save_every > 0 and self.global_step % self.save_every == 0:

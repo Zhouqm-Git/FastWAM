@@ -52,6 +52,7 @@ def _compute_chunk_level_objective(
             sigma_max=sigma_max,
             num_inference_steps=num_inference_steps,
             sigma_shift=sigma_shift,
+            exec_horizon=chunk.exec_horizon,
         ).float()
         log_ratio = (new_log_prob - old_log_prob) / float(chunk.block_size)
         ratio = torch.exp(log_ratio)
@@ -136,6 +137,7 @@ def _compute_trajectory_level_objective(
                 sigma_max=sigma_max,
                 num_inference_steps=num_inference_steps,
                 sigma_shift=sigma_shift,
+                exec_horizon=chunk.exec_horizon,
             ).float()
             new_total = new_log_prob if new_total is None else new_total + new_log_prob
             old_total = old_log_prob if old_total is None else old_total + old_log_prob

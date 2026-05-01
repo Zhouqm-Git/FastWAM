@@ -1100,6 +1100,7 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        exec_horizon: Optional[int] = None,
     ) -> dict[str, Any]:
         """Flow-GSPO action inference: SDE sampling with log-probability tracking.
 
@@ -1109,6 +1110,9 @@ class FastWAM(torch.nn.Module):
         Args:
             sigma_max: SDE noise upper bound. 0.0 = pure ODE (deterministic),
                 0.1 = OmniVLA-RL default. Controls exploration strength.
+            exec_horizon: If set, log_prob only covers the first exec_horizon
+                action steps. Sampling still operates on the full action_horizon.
+                None = use all action_horizon steps.
             (All other args same as infer_action.)
 
         Returns:
@@ -1254,6 +1258,7 @@ class FastWAM(torch.nn.Module):
                 sigma,
                 sigma_max,
                 generator=generator,
+                exec_horizon=exec_horizon,
             )
 
             latents_action = next_sample
@@ -1281,6 +1286,7 @@ class FastWAM(torch.nn.Module):
         sigma_max: float = 0.1,
         num_inference_steps: int = 10,
         sigma_shift: Optional[float] = None,
+        exec_horizon: Optional[int] = None,
     ) -> torch.Tensor:
         """Recompute log-prob from a stored denoising chain, WITH gradients.
 
@@ -1298,6 +1304,9 @@ class FastWAM(torch.nn.Module):
             sigma_max: SDE noise upper bound (must match rollout-time value).
             num_inference_steps: Number of denoising steps (must match rollout-time value).
             sigma_shift: Shift override for inference schedule.
+            exec_horizon: If set, log_prob only covers the first exec_horizon
+                action steps. The chain still uses full H for velocity computation.
+                None = use all action steps.
 
         Returns:
             Scalar log-prob with gradient w.r.t. action_expert parameters.
@@ -1399,19 +1408,31 @@ class FastWAM(torch.nn.Module):
             # Flow-GSPO transition log-prob
             sigma = step_t.float() / float(self.infer_action_scheduler.num_train_timesteps)
             sigma_tau = sigma_max * sigma
-            # mean = x_tau + v_theta * delta  (simplified for small sigma_max)
-            mean = chains_prev[i].detach() + pred_velocity * step_delta
+            tau = 1.0 - sigma
+
+            # Score correction (paper eq.12):
+            # drift = v_theta + sigma_tau^2/2 * (x_tau + (1-tau)*v_theta)
+            # mu_tau = x_tau + drift * delta
+            score_correction = (sigma_tau ** 2 / 2.0) * (
+                chains_prev[i].detach() + (1.0 - tau) * pred_velocity
+            )
+            drift = pred_velocity + score_correction
+            mean = chains_prev[i].detach() + drift * step_delta
             std = sigma_tau * torch.sqrt((-step_delta).float())
 
             if std.abs() < 1e-12:
                 log_probs.append(torch.tensor(0.0, device=self.device, dtype=torch.float32))
             else:
-                # log N(x_next | mean, std^2 * I) averaged over all dimensions
+                # log N(x_next | mean, std^2 * I): standard multivariate Gaussian log-density (paper eq.14)
                 diff = (chains_next[i].detach() - mean) ** 2
+                if exec_horizon is not None:
+                    # Marginal log-density for executed action steps only
+                    diff = diff[:, :exec_horizon, :]
+                num_elements = diff.numel()  # exec_horizon * D or H * D
                 log_prob = (
-                    -0.5 * diff.mean() / (std ** 2)
-                    - torch.log(std)
-                    - 0.5 * math.log(2.0 * math.pi)
+                    -0.5 * diff.sum() / (std ** 2)
+                    - num_elements * torch.log(std)
+                    - 0.5 * num_elements * math.log(2.0 * math.pi)
                 )
                 log_probs.append(log_prob)
 

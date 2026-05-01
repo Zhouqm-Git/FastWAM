@@ -55,39 +55,6 @@ def compute_gspo_trajectory_advantages(buffer: RolloutBuffer) -> None:
                 chunk.advantage = float(adv)
 
 
-def compute_gspo_block_advantages(buffer: RolloutBuffer, gamma: float = 1.0) -> None:
-    """Flow-GSPO block-level advantage (Exp-1, baseline comparison).
-
-    Direct transfer of OmniVLA-RL original approach:
-    1. For each (task_id, chunk_index), collect block reward from different trajectories.
-    2. R_total(A_{i,t}, s_t) = sum gamma^h * R(s_t, a_{t,i,h}).
-    3. Normalize by group.
-
-    Note: This requires block reward to have discernible variance.
-    """
-    groups: dict[tuple[str, int], list] = defaultdict(list)
-    for traj in buffer.trajectories:
-        for t, chunk in enumerate(traj.chunks):
-            block_reward = sum(gamma**h * r for h, r in enumerate(chunk.chunk_rewards))
-            chunk_index = chunk.chunk_index if chunk.chunk_index >= 0 else t
-            group_key = chunk.group_id or traj.group_id or traj.task_id
-            groups[(group_key, chunk_index)].append((chunk, block_reward))
-
-    for _, items in groups.items():
-        rewards = [r for _, r in items]
-        std_r = np.std(rewards)
-        if std_r < 1e-6:
-            for chunk, _ in items:
-                chunk.advantage = 0.0
-            continue
-        mean_r = np.mean(rewards)
-        for chunk, block_reward in items:
-            chunk.advantage = float((block_reward - mean_r) / (std_r + 1e-8))
-
-    for traj in buffer.trajectories:
-        traj.trajectory_advantage = 0.0
-
-
 def compute_gspo_trajectory_decay_advantages(
     buffer: RolloutBuffer, gamma: float = 0.99
 ) -> None:

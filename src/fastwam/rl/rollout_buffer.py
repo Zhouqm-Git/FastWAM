@@ -53,6 +53,7 @@ class ChunkData:
     chain: torch.Tensor
     old_log_prob: torch.Tensor
     block_size: int
+    exec_horizon: Optional[int] = None
     action: torch.Tensor
     chunk_rewards: list[float] = field(default_factory=list)
     done: bool = False

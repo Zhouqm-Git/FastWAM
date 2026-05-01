@@ -117,6 +117,26 @@ class RolloutCollector:
         self._seed_base = None if cfg.get("seed") is None else int(cfg.seed)
         self._sample_counter = 0
 
+        # --- Ablation: action horizon & log-prob coverage ---
+        # rl.action_horizon overrides the prediction horizon passed to the model.
+        #   null  = use default (e.g., 32 from data.train.num_frames - 1)
+        #   int   = override to this value (e.g., 10 for predict=exec matching)
+        # rl.exec_horizon controls log_prob coverage for partial execution.
+        #   null  = log_prob covers all predicted actions
+        #   int   = log_prob only covers the first N actions (GR00T-style slicing)
+        rl_ah = cfg.rl.get("action_horizon")
+        if rl_ah is not None:
+            self.action_horizon = int(rl_ah)
+            logger.info(
+                "RL action_horizon override: %d (default was %d)",
+                self.action_horizon, action_horizon,
+            )
+        self.exec_horizon = (
+            int(cfg.rl.get("exec_horizon"))
+            if cfg.rl.get("exec_horizon") is not None
+            else None
+        )
+
     def _next_inference_seed(self) -> Optional[int]:
         if self._seed_base is None:
             return None
@@ -268,6 +288,7 @@ class RolloutCollector:
 
         chunks: list[ChunkData] = []
         pending_actions: list[list[float]] = []
+        first_chunk_seed: Optional[int] = None
 
         t = 0
         done = False
@@ -277,6 +298,8 @@ class RolloutCollector:
                 model_input = self._obs_to_model_input(obs, task_description)
                 chunk_index = len(chunks)
                 chunk_seed = self._next_inference_seed()
+                if first_chunk_seed is None:
+                    first_chunk_seed = chunk_seed
                 result = self.model.infer_action_with_logprob(
                     prompt=None,
                     context=model_input["context"],
@@ -296,6 +319,7 @@ class RolloutCollector:
                     seed=chunk_seed,
                     rand_device=str(self.cfg.EVALUATION.get("rand_device", "cpu")),
                     tiled=bool(self.cfg.EVALUATION.get("tiled", False)),
+                    exec_horizon=self.exec_horizon,
                 )
 
                 # Post-process actions for environment execution
@@ -303,6 +327,7 @@ class RolloutCollector:
                 pending_actions = list(actions[: self.replan_steps])
 
                 # Store chunk data
+                effective_horizon = self.exec_horizon if self.exec_horizon is not None else self.action_horizon
                 chunk = ChunkData(
                     obs_image=model_input["input_image"].cpu(),
                     obs_proprio=(
@@ -314,7 +339,8 @@ class RolloutCollector:
                     context_mask=model_input["context_mask"].cpu(),
                     chain=result["chain"].cpu(),
                     old_log_prob=result["log_prob"].cpu(),
-                    block_size=self.action_horizon * self.num_inference_steps,
+                    block_size=effective_horizon * self.num_inference_steps,
+                    exec_horizon=self.exec_horizon,
                     action=result["action"].cpu(),
                     chunk_rewards=[],
                     done=False,
@@ -361,7 +387,7 @@ class RolloutCollector:
             reset_id=reset_id,
             initial_state_index=initial_state_index,
             trajectory_id=trajectory_id,
-            rollout_seed=self._seed_base,
+            rollout_seed=first_chunk_seed,
             rollout_time=time.perf_counter() - trajectory_start_time,
             task_suite_name=str(self.cfg.EVALUATION.task_suite_name),
             reward_components={"success": trajectory_reward},
