@@ -1,0 +1,73 @@
+# @package _global_
+
+defaults:
+  - sim_libero
+  - _self_
+
+output_dir: ./runs/rl/${rl.variant}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+# RL init checkpoint
+ckpt: null
+
+wandb:
+  enabled: false
+  workspace: null
+  project: fast-wam-rl
+  name: flow-gspo-${rl.variant}
+  group: ${EVALUATION.task_suite_name}
+  mode: online
+
+rl:
+  # Variants:
+  # - block:      original Flow-GSPO
+  # - traj_chunk: trajectory-level advantage + chunk-level ratio
+  # - traj_traj:  trajectory-level advantage + trajectory-level ratio
+  variant: traj_chunk
+  max_updates: 100
+  group_size: 8
+  task_batch_size: 1
+  num_optimization_epochs: 1
+
+  # Advantage assignment
+  trajectory_assignment: uniform
+  advantage_gamma: 0.99
+
+  # Policy optimization
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  clip_range: 0.2
+  kl_coef: 0.01
+
+  # Flow sampling
+  sigma_max: 0.1
+  num_inference_steps: 10
+
+  # Trainable scope
+  trainable_scope: action_expert_only
+
+  # Task selection
+  task_ids: null
+
+  # Logging / checkpointing
+  log_every: 1
+  save_every: 10
+  resume: null
+  logging:
+    backends: []
+
+EVALUATION:
+  task_suite_name: libero_spatial
+  env_num: 1
+  num_steps_wait: 30
+  replan_steps: 10
+  action_horizon: null
+  num_inference_steps: ${rl.num_inference_steps}
+  sigma_shift: null
+  text_cfg_scale: 1.0
+  negative_prompt: ""
+  rand_device: cpu
+  tiled: false
+  binarize_gripper: true
+  dataset_stats_path: null
+  device: cuda

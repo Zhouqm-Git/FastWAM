@@ -11,6 +11,7 @@ import numpy as np
 from einops import repeat
 from omegaconf import OmegaConf
 
+from .rl.trainer import FastWAMRLTrainer
 from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger, setup_logging
 from .utils.video_io import save_mp4
@@ -378,6 +379,24 @@ def run_training(cfg: DictConfig):
         train_dataset=train_ds,
         val_dataset=val_ds,
     )
+    trainer.train()
+
+
+def run_rl_training(cfg: DictConfig):
+    setup_logging(
+        log_level=logging.INFO,
+        is_main_process=True,
+    )
+    misc.register_work_dir(cfg.output_dir)
+    config_payload = OmegaConf.to_container(cfg, resolve=True)
+    with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
+        OmegaConf.save(config_payload, f)
+
+    model_device = _resolve_train_device()
+    mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
+    model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    trainer = FastWAMRLTrainer(model=model, cfg=cfg)
     trainer.train()
 
 def run_inference(cfg: DictConfig):

@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -86,3 +88,78 @@ class WanContinuousFlowMatchScheduler:
             return sample + model_output * delta
         delta = delta.view(-1, *([1] * (sample.ndim - 1)))
         return sample + model_output * delta
+
+    @staticmethod
+    def step_sde_with_logprob(
+        model_output: torch.Tensor,
+        delta: torch.Tensor,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_max: float = 0.1,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flow-GSPO SDE sampling step with log-probability.
+
+        Based on OmniVLA-RL equations 10-13.
+        Noise schedule: sigma_tau = sigma_max * (1 - tau)  (linear decay)
+        Transition:     p(x_{tau+delta} | x_tau, s) ~ N(mu_tau, Sigma_tau)
+        Where:
+          mu_tau = x_tau + [v_theta + sigma_tau^2/2 * (x_tau + (1-tau)*v_theta)] * delta
+          Sigma_tau = sigma_tau^2 * delta * I
+
+        When sigma_max=0.1 is small, the score correction term is negligible:
+          mu_tau ≈ x_tau + v_theta * delta
+
+        Args:
+            model_output: Predicted velocity v_theta, shape [1, T, D].
+            delta: sigma_{i+1} - sigma_i (negative scalar).
+            sample: Current noisy sample x_t, shape [1, T, D].
+            sigma: Current sigma_t (scalar, in [0,1]).
+            sigma_max: SDE noise upper bound (default 0.1).
+
+        Returns:
+            next_sample: Sampled x_{tau+delta}.
+            log_prob:    log p(x_{tau+delta} | x_tau, s), scalar.
+            mean:        Deterministic mean mu_tau.
+            std:         Noise standard deviation (scalar).
+        """
+        delta = delta.to(sample.device, dtype=torch.float32)
+        sample_f = sample.float()
+        model_output_f = model_output.float()
+
+        # tau = 1 - sigma (denoising progress: sigma 1->0 maps to tau 0->1)
+        tau = 1.0 - sigma.float()
+        # sigma_tau = sigma_max * (1 - tau) = sigma_max * sigma
+        sigma_tau = sigma_max * sigma.float()
+
+        # Deterministic mean: mu_tau = x_t + v_theta * delta  (simplified, sigma_max small)
+        mean = sample_f + model_output_f * delta
+
+        # Noise scale: sigma_tau * sqrt(|delta|)
+        abs_delta = (-delta).float()  # delta is negative, so |delta| = -delta
+        std = sigma_tau * torch.sqrt(abs_delta)
+
+        # Sample: x_next = mean + std * randn
+        noise = torch.randn(
+            sample_f.shape,
+            generator=generator,
+            device=sample_f.device,
+            dtype=sample_f.dtype,
+        )
+        next_sample = mean + std * noise
+
+        # log p(x_next | mean, std^2 * I) = -0.5 * ((x_next - mean)^2 / std^2).mean() - log(std) - 0.5*log(2pi)
+        # .mean() over all dimensions (not .sum()) so log-probs are comparable across chunk sizes
+        if std.abs() < 1e-12:
+            # sigma_max=0 degenerate case: deterministic step, log_prob=0
+            log_prob = torch.tensor(0.0, device=sample.device, dtype=torch.float32)
+        else:
+            diff = (next_sample - mean) ** 2
+            log_prob = -0.5 * diff.mean() / (std ** 2) - torch.log(std) - 0.5 * math.log(2.0 * math.pi)
+
+        return (
+            next_sample.to(dtype=sample.dtype),
+            log_prob,
+            mean.to(dtype=sample.dtype),
+            std,
+        )

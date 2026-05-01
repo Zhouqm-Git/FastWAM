@@ -1,3 +1,4 @@
+import math
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -722,6 +723,41 @@ class FastWAM(torch.nn.Module):
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
+    def _forward_action_predict(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        """Same logic as _predict_action_noise_with_cache but WITHOUT @torch.no_grad().
+
+        Preserves the gradient graph through action_expert parameters.
+        Used by compute_logprob_from_chain() to recompute log-prob with current theta.
+        """
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
     @torch.no_grad()
     def infer_joint(
         self,
@@ -1046,6 +1082,340 @@ class FastWAM(torch.nn.Module):
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+
+    @torch.no_grad()
+    def infer_action_with_logprob(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        sigma_max: float = 0.1,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        """Flow-GSPO action inference: SDE sampling with log-probability tracking.
+
+        Like infer_action() but uses SDE denoising (OmniVLA-RL eq. 10-13) and records
+        the full denoising chain + per-step log-probs for GSPO training.
+
+        Args:
+            sigma_max: SDE noise upper bound. 0.0 = pure ODE (deterministic),
+                0.1 = OmniVLA-RL default. Controls exploration strength.
+            (All other args same as infer_action.)
+
+        Returns:
+            Dict with:
+                action: [H, action_dim] denoised action on CPU.
+                chain: [K+1, H, action_dim] full denoising trajectory on CPU.
+                log_prob: scalar, sum of per-step log-probs.
+                log_probs_per_step: list[K] of per-step log-probs on CPU.
+        """
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "`infer_action_with_logprob` requires `video_attention_mask_mode='first_frame_causal'`."
+            )
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+            )
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
+            )
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context_mask.ndim != 2:
+                raise ValueError(
+                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+
+        # Video prefill (same as infer_action)
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+
+        # --- Flow-GSPO core: SDE denoising with chain tracking ---
+        chain = [latents_action.detach().cpu().float()]  # [K+1, H, D]
+        log_probs_per_step = []
+
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+
+            pred_velocity = self._predict_action_noise_with_cache(
+                latents_action=latents_action,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+
+            # SDE step instead of ODE step
+            sigma = step_t_action.float() / float(self.infer_action_scheduler.num_train_timesteps)
+            next_sample, log_prob, _mean, _std = self.infer_action_scheduler.step_sde_with_logprob(
+                pred_velocity,
+                step_delta_action,
+                latents_action,
+                sigma,
+                sigma_max,
+                generator=generator,
+            )
+
+            latents_action = next_sample
+            chain.append(latents_action.detach().cpu().float())
+            log_probs_per_step.append(log_prob.cpu())
+
+        # Block-level log-likelihood: log pi(A_t|s_t) = sum of per-step transition log-probs
+        total_log_prob = sum(log_probs_per_step)
+
+        return {
+            "action": latents_action[0].detach().cpu().float(),
+            "chain": torch.stack(chain),  # [K+1, H, D]
+            "log_prob": total_log_prob,
+            "log_probs_per_step": log_probs_per_step,
+        }
+
+    def compute_logprob_from_chain(
+        self,
+        chain: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        input_image: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        video_kv_cache=None,
+        sigma_max: float = 0.1,
+        num_inference_steps: int = 10,
+        sigma_shift: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Recompute log-prob from a stored denoising chain, WITH gradients.
+
+        The chain values are treated as constants (detached), but pred_velocity
+        flows through action_expert parameters theta, so the returned log-prob
+        has gradients w.r.t. theta. This is used for the GSPO importance ratio.
+
+        Args:
+            chain: Denoising trajectory [K+1, H, action_dim] on CPU.
+            context: Text context [1, L, D].
+            context_mask: Context mask [1, L].
+            input_image: Observation image [1, 3, H, W].
+            proprio: Optional proprio [1, D] or [D].
+            video_kv_cache: Pre-computed video KV cache (optional, recomputed if None).
+            sigma_max: SDE noise upper bound (must match rollout-time value).
+            num_inference_steps: Number of denoising steps (must match rollout-time value).
+            sigma_shift: Shift override for inference schedule.
+
+        Returns:
+            Scalar log-prob with gradient w.r.t. action_expert parameters.
+        """
+        self.eval()
+        K_plus_1 = chain.shape[0]
+        if K_plus_1 < 2:
+            raise ValueError(f"chain must have at least 2 entries (noise + result), got {K_plus_1}")
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        context = context.to(device=self.device, dtype=self.torch_dtype)
+        context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        # Recompute video KV cache if not provided
+        if video_kv_cache is None:
+            first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image)
+            fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+            if proprio is not None:
+                ctx, ctx_mask = self._append_proprio_to_context(context, context_mask, proprio)
+            else:
+                ctx, ctx_mask = context, context_mask
+
+            timestep_video = torch.zeros(
+                (first_frame_latents.shape[0],),
+                dtype=first_frame_latents.dtype,
+                device=self.device,
+            )
+            video_pre = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_video,
+                context=ctx,
+                context_mask=ctx_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+            video_seq_len = int(video_pre["tokens"].shape[1])
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=chain.shape[1],
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                device=video_pre["tokens"].device,
+            )
+            video_kv_cache = self.mot.prefill_video_cache(
+                video_tokens=video_pre["tokens"],
+                video_freqs=video_pre["freqs"],
+                video_t_mod=video_pre["t_mod"],
+                video_context_payload={
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            )
+        else:
+            video_seq_len = video_kv_cache[0]["k"].shape[1]
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=chain.shape[1],
+                video_tokens_per_frame=int(video_seq_len),
+                device=self.device,
+            )
+
+        # Build inference schedule
+        infer_timesteps, infer_deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=K_plus_1 - 1,
+            device=self.device,
+            dtype=self.torch_dtype,
+            shift_override=sigma_shift,
+        )
+
+        chains_prev = chain[:-1].to(device=self.device, dtype=self.torch_dtype)  # [K, H, D] — constant
+        chains_next = chain[1:].to(device=self.device, dtype=self.torch_dtype)   # [K, H, D] — constant
+
+        if proprio is not None:
+            ctx, ctx_mask = self._append_proprio_to_context(context, context_mask, proprio)
+        else:
+            ctx, ctx_mask = context, context_mask
+
+        log_probs = []
+        for i in range(K_plus_1 - 1):
+            step_t = infer_timesteps[i]
+            step_delta = infer_deltas[i]
+
+            # Forward pass WITH gradients through action_expert parameters
+            pred_velocity = self._forward_action_predict(
+                chains_prev[i : i + 1].detach(),  # chain values are constant
+                step_t.unsqueeze(0),
+                ctx,
+                ctx_mask,
+                video_kv_cache,
+                attention_mask,
+                video_seq_len,
+            )
+
+            # Flow-GSPO transition log-prob
+            sigma = step_t.float() / float(self.infer_action_scheduler.num_train_timesteps)
+            sigma_tau = sigma_max * sigma
+            # mean = x_tau + v_theta * delta  (simplified for small sigma_max)
+            mean = chains_prev[i].detach() + pred_velocity * step_delta
+            std = sigma_tau * torch.sqrt((-step_delta).float())
+
+            if std.abs() < 1e-12:
+                log_probs.append(torch.tensor(0.0, device=self.device, dtype=torch.float32))
+            else:
+                # log N(x_next | mean, std^2 * I) averaged over all dimensions
+                diff = (chains_next[i].detach() - mean) ** 2
+                log_prob = (
+                    -0.5 * diff.mean() / (std ** 2)
+                    - torch.log(std)
+                    - 0.5 * math.log(2.0 * math.pi)
+                )
+                log_probs.append(log_prob)
+
+        return sum(log_probs)  # has gradient w.r.t. action_expert parameters
 
     @torch.no_grad()
     def infer(
