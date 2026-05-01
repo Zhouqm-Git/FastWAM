@@ -35,9 +35,9 @@ def compute_gspo_trajectory_advantages(buffer: RolloutBuffer) -> None:
     """
     groups: dict[str, list] = defaultdict(list)
     for traj in buffer.trajectories:
-        groups[traj.task_id].append(traj)
+        groups[traj.group_id or traj.task_id].append(traj)
 
-    for task_id, group in groups.items():
+    for _, group in groups.items():
         rewards = [t.trajectory_reward for t in group]
         std_r = np.std(rewards)
 
@@ -69,9 +69,11 @@ def compute_gspo_block_advantages(buffer: RolloutBuffer, gamma: float = 1.0) -> 
     for traj in buffer.trajectories:
         for t, chunk in enumerate(traj.chunks):
             block_reward = sum(gamma**h * r for h, r in enumerate(chunk.chunk_rewards))
-            groups[(traj.task_id, t)].append((chunk, block_reward))
+            chunk_index = chunk.chunk_index if chunk.chunk_index >= 0 else t
+            group_key = chunk.group_id or traj.group_id or traj.task_id
+            groups[(group_key, chunk_index)].append((chunk, block_reward))
 
-    for key, items in groups.items():
+    for _, items in groups.items():
         rewards = [r for _, r in items]
         std_r = np.std(rewards)
         if std_r < 1e-6:
@@ -96,9 +98,9 @@ def compute_gspo_trajectory_decay_advantages(
     """
     groups: dict[str, list] = defaultdict(list)
     for traj in buffer.trajectories:
-        groups[traj.task_id].append(traj)
+        groups[traj.group_id or traj.task_id].append(traj)
 
-    for task_id, group in groups.items():
+    for _, group in groups.items():
         rewards = [t.trajectory_reward for t in group]
         std_r = np.std(rewards)
         if std_r < 1e-6:

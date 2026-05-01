@@ -6,6 +6,7 @@ replaces ODE denoising with SDE sampling + chain tracking.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -241,6 +242,10 @@ class RolloutCollector:
         task_description: str,
         task_id: str,
         initial_state=None,
+        group_id: str = "",
+        reset_id: str = "",
+        initial_state_index: int = -1,
+        trajectory_id: str = "",
         max_steps: Optional[int] = None,
     ) -> TrajectoryData:
         """Run a complete trajectory in the environment.
@@ -251,6 +256,7 @@ class RolloutCollector:
         """
         if max_steps is None:
             max_steps = _get_max_steps(str(self.cfg.EVALUATION.task_suite_name))
+        trajectory_start_time = time.perf_counter()
 
         obs = self.env.reset()
         if initial_state is not None:
@@ -269,6 +275,8 @@ class RolloutCollector:
             if not pending_actions:
                 # Flow-GSPO: SDE sampling + chain tracking
                 model_input = self._obs_to_model_input(obs, task_description)
+                chunk_index = len(chunks)
+                chunk_seed = self._next_inference_seed()
                 result = self.model.infer_action_with_logprob(
                     prompt=None,
                     context=model_input["context"],
@@ -285,7 +293,7 @@ class RolloutCollector:
                         if self.cfg.EVALUATION.get("sigma_shift") is None
                         else float(self.cfg.EVALUATION.get("sigma_shift"))
                     ),
-                    seed=self._next_inference_seed(),
+                    seed=chunk_seed,
                     rand_device=str(self.cfg.EVALUATION.get("rand_device", "cpu")),
                     tiled=bool(self.cfg.EVALUATION.get("tiled", False)),
                 )
@@ -311,6 +319,17 @@ class RolloutCollector:
                     chunk_rewards=[],
                     done=False,
                     task_id=task_id,
+                    group_id=group_id,
+                    reset_id=reset_id,
+                    initial_state_index=initial_state_index,
+                    trajectory_id=trajectory_id,
+                    chunk_index=chunk_index,
+                    env_step_start=t,
+                    env_step_end=t,
+                    rollout_seed=chunk_seed,
+                    rollout_time=time.perf_counter() - trajectory_start_time,
+                    task_suite_name=str(self.cfg.EVALUATION.task_suite_name),
+                    reward_components={},
                     task_description=task_description,
                 )
                 chunks.append(chunk)
@@ -322,6 +341,7 @@ class RolloutCollector:
             # Record reward to current chunk
             chunks[-1].chunk_rewards.append(float(reward))
             t += 1
+            chunks[-1].env_step_end = t
 
             if done:
                 chunks[-1].done = True
@@ -337,6 +357,14 @@ class RolloutCollector:
             chunks=chunks,
             trajectory_reward=trajectory_reward,
             success=success,
+            group_id=group_id,
+            reset_id=reset_id,
+            initial_state_index=initial_state_index,
+            trajectory_id=trajectory_id,
+            rollout_seed=self._seed_base,
+            rollout_time=time.perf_counter() - trajectory_start_time,
+            task_suite_name=str(self.cfg.EVALUATION.task_suite_name),
+            reward_components={"success": trajectory_reward},
         )
 
     def collect_group(
@@ -345,6 +373,9 @@ class RolloutCollector:
         task_id: str,
         group_size: int = 8,
         initial_state=None,
+        group_id: str = "",
+        reset_id: str = "",
+        initial_state_index: int = -1,
         max_steps: Optional[int] = None,
     ) -> RolloutBuffer:
         """Flow-GSPO: sample G trajectories for the same task.
@@ -353,11 +384,15 @@ class RolloutCollector:
             A_hat_i = (R_i - mean) / std
         """
         buffer = RolloutBuffer()
-        for _ in range(group_size):
+        for traj_idx in range(group_size):
             traj = self.collect_trajectory(
                 task_description=task_description,
                 task_id=task_id,
                 initial_state=initial_state,
+                group_id=group_id,
+                reset_id=reset_id,
+                initial_state_index=initial_state_index,
+                trajectory_id=f"{group_id or task_id}:traj_{traj_idx:03d}",
                 max_steps=max_steps,
             )
             buffer.add_trajectory(traj)

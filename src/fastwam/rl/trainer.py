@@ -257,24 +257,36 @@ class FastWAMRLTrainer:
             self.task_cursor += 1
         return batch
 
-    def _next_initial_state(self, task_id: int, initial_states: list[Any]) -> Any:
+    def _next_initial_state(self, task_id: int, initial_states: list[Any]) -> tuple[int, Any]:
         if not initial_states:
             raise ValueError(f"No initial states found for task_id={task_id}.")
         cursor = self._task_state_cursors.get(task_id, 0)
-        state = initial_states[cursor % len(initial_states)]
+        initial_state_index = cursor % len(initial_states)
+        state = initial_states[initial_state_index]
         self._task_state_cursors[task_id] = cursor + 1
-        return state
+        return initial_state_index, state
 
     def _collect_rollout_buffer(self) -> RolloutBuffer:
         buffer = RolloutBuffer()
-        for task_id in self._next_task_batch():
+        for batch_index, task_id in enumerate(self._next_task_batch()):
             runtime = self._get_task_runtime(task_id)
-            initial_state = self._next_initial_state(task_id, runtime["initial_states"])
+            initial_state_index, initial_state = self._next_initial_state(
+                task_id, runtime["initial_states"]
+            )
+            task_key = f"{self.cfg.EVALUATION.task_suite_name}:{task_id}"
+            reset_id = f"{task_key}:reset_{initial_state_index:04d}"
+            group_id = (
+                f"{task_key}:update_{self.global_step:06d}:batch_{batch_index:03d}:"
+                f"reset_{initial_state_index:04d}"
+            )
             task_buffer = runtime["collector"].collect_group(
                 task_description=runtime["task_description"],
-                task_id=f"{self.cfg.EVALUATION.task_suite_name}:{task_id}",
+                task_id=task_key,
                 group_size=self.group_size,
                 initial_state=initial_state,
+                group_id=group_id,
+                reset_id=reset_id,
+                initial_state_index=initial_state_index,
             )
             buffer.extend(task_buffer)
         return buffer

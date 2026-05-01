@@ -41,7 +41,7 @@ def compute_rollout_metrics(buffer: RolloutBuffer) -> dict[str, float]:
 
     groups: dict[str, list[float]] = defaultdict(list)
     for traj in trajectories:
-        groups[traj.task_id].append(traj.trajectory_reward)
+        groups[traj.group_id or traj.task_id].append(traj.trajectory_reward)
     group_stds = np.asarray([np.std(v, dtype=np.float32) for v in groups.values()], dtype=np.float32)
     informative_fraction = float((group_stds > 1e-6).mean()) if group_stds.size > 0 else 0.0
 

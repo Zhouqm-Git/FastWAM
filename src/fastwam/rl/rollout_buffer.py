@@ -31,6 +31,17 @@ class ChunkData:
         chunk_rewards: Per-step rewards within this action block.
         done: Whether the episode terminated during this chunk.
         task_id: Task identifier for group advantage normalization.
+        group_id: Reset-aligned rollout group identifier for GSPO normalization.
+        reset_id: Reset identifier within a task.
+        initial_state_index: Index of the initial state used for this rollout.
+        trajectory_id: Parent trajectory identifier.
+        chunk_index: Chunk index within the trajectory.
+        env_step_start: Inclusive environment-step index where this chunk starts.
+        env_step_end: Exclusive environment-step index where this chunk ends.
+        rollout_seed: Sampling seed used to start this chunk, if configured.
+        rollout_time: Trajectory-relative collection timestamp in seconds.
+        task_suite_name: Benchmark suite name.
+        reward_components: Named reward breakdowns for later analysis.
         task_description: Natural language task description.
         advantage: Filled by advantages.py. Trajectory-level GSPO advantage.
     """
@@ -46,6 +57,17 @@ class ChunkData:
     chunk_rewards: list[float] = field(default_factory=list)
     done: bool = False
     task_id: str = ""
+    group_id: str = ""
+    reset_id: str = ""
+    initial_state_index: int = -1
+    trajectory_id: str = ""
+    chunk_index: int = -1
+    env_step_start: int = 0
+    env_step_end: int = 0
+    rollout_seed: Optional[int] = None
+    rollout_time: float = 0.0
+    task_suite_name: str = ""
+    reward_components: dict[str, float] = field(default_factory=dict)
     task_description: str = ""
     advantage: float = 0.0
 
@@ -57,9 +79,17 @@ class TrajectoryData:
     Attributes:
         task_id: Task identifier (same for all chunks in a group).
         task_description: Natural language task description.
+        group_id: Reset-aligned rollout group identifier for GSPO normalization.
+        reset_id: Reset identifier within a task.
+        initial_state_index: Index of the initial state used for this rollout.
+        trajectory_id: Unique trajectory identifier.
         chunks: Ordered list of ChunkData making up this trajectory.
         trajectory_reward: Terminal reward (1.0 success, 0.0 failure for LIBERO).
         success: Whether the task was completed successfully.
+        rollout_seed: Base rollout seed, if configured.
+        rollout_time: Collection duration in seconds.
+        task_suite_name: Benchmark suite name.
+        reward_components: Named reward breakdowns for later analysis.
         trajectory_advantage: Trajectory-level advantage assigned by GSPO.
     """
 
@@ -68,6 +98,14 @@ class TrajectoryData:
     chunks: list[ChunkData]
     trajectory_reward: float
     success: bool
+    group_id: str = ""
+    reset_id: str = ""
+    initial_state_index: int = -1
+    trajectory_id: str = ""
+    rollout_seed: Optional[int] = None
+    rollout_time: float = 0.0
+    task_suite_name: str = ""
+    reward_components: dict[str, float] = field(default_factory=dict)
     trajectory_advantage: float = 0.0
 
 
