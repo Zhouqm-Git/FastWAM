@@ -255,30 +255,34 @@ $$s = \exp\left(\frac{1}{HK}\sum_{k,h}\log\frac{p_\theta(x^{k,h})}{p_{\theta_{\t
 - RLinf FlowPolicy（pi_0）：预测步数 = 执行步数，不存在此问题
 - RLinf GR00T：`action_horizon=16`（内部预测），`action_chunk=4`（实际输出），log_prob 显式切片到 `action_chunk` 维度，与方案 slice 一致
 
-### 5.3 两种方案的 Attention 差异
+### 5.3 Attention 因果性与截断的理论分析
 
-MoT 中 action tokens 的 attention mask（`fastwam.py:404`）：
+SDE 每步的均值为 $\mu_k = x_k + \text{drift}(v_\theta(x_k, \tau), \delta)$，其中 $v_\theta$ 通过 attention 计算。$\mu_k[h]$ 依赖哪些 token 取决于 attention 的因果性。
+
+**Causal attention**（如 OmniVLA-RL）：$v_\theta[h]$ 只依赖 $x_k[:h+1]$。当 $h < H'$ 时，$v_\theta[h]$ 不受 $x_k[H':]$ 影响，$\mu_k[:H']$ 只由 $x_k[:H']$ 决定。因此 match 和 slice 产生**完全一致的 log_prob**，截断无意义。
+
+**Bidirectional attention**（FastWAM）：$v_\theta[h]$ 依赖 $x_k[:H]$（全部 token）。即使 $h < H'$，$\mu_k[h]$ 仍通过 self-attention 依赖 $x_k[H':]$。因此 match 和 slice 产生**不同的 log_prob**，是本质不同的计算。
+
+FastWAM 的 attention mask（`fastwam.py:404`）：
 
 ```python
-# action -> action: 全连接 self-attention
+# action -> action: 全连接 bidirectional self-attention
 mask[video_seq_len:, video_seq_len:] = True
 ```
 
-每层 MoT 将 action tokens 与 video KV cache 拼接后做 mixed attention（`mot.py:426-433`）：
+每层 MoT 将 action tokens 与 video KV cache 拼接（`mot.py:426-433`）：
 
 ```python
-k_cat = torch.cat([k_video, k_action], dim=1)  # video + action keys
+k_cat = torch.cat([k_video, k_action], dim=1)  # video + 全部 action keys
 mixed = self._mixed_attention(q_cat=q_action, k_cat=k_cat, v_cat=v_cat, ...)
 ```
 
-**Match（action_horizon=10）**：每个 action token 的 attention context = 10 个 action token + video tokens。
-
-**Slice（action_horizon=32）**：每个 action token 的 attention context = **32** 个 action token + video tokens。
-
-前 10 个 token 的 velocity 预测在两种情况下不同，因为 attention 的 key/value 数量不同。这不是 log_prob 截断能弥补的——模型内部的计算已经分叉。因此两个方案测试的是本质不同的问题：
-
-- **Match**：模型在 10-token 短期上下文中做规划，action tokens 之间交互范围小
-- **Slice**：模型在 32-token 长期上下文中做规划但只对短期部分算 ratio，action tokens 之间交互范围大
+| | Causal (OmniVLA-RL) | Bidirectional (FastWAM) |
+|---|---|---|
+| $v_\theta[h]$ 依赖范围 | $x_k[:h+1]$ | $x_k[:H]$ |
+| 截断后 $\mu_k[:H']$ | 只依赖 $x_k[:H']$ | 依赖**全部** $x_k$ |
+| match vs slice | 完全等价 | **不同** |
+| 截断是否有意义 | 无 | 有 |
 
 ### 5.4 Log-prob 截断的数学基础
 
@@ -294,7 +298,12 @@ $$\log p(x_{k+1} | x_k) = \sum_{h=1}^{H}\sum_{d=1}^{D}\left[-\frac{(x_{k+1}[h,d]
 
 $$\log p(x_{k+1}[\,:H',:\,] | x_k) = \sum_{h=1}^{H'}\sum_{d=1}^{D}\left[-\frac{(x_{k+1}[h,d]-\mu_k[h,d])^2}{2\sigma_k^2} - \log\sigma_k - \frac{1}{2}\log 2\pi\right]$$
 
-注意：均值 $\mu_k$ 仍通过 self-attention 依赖所有 $H$ 个 action 的状态 $x_k$（neural network 的全局依赖性），但 $x_{k+1}$ 各维度在 log density 中的贡献是独立的（对角协方差保证）。因此截断是合法的边际化操作，不是近似。
+这是合法的边际化操作（对角协方差保证各维度独立），不是近似。
+
+在 FastWAM 的 bidirectional attention 下，截断的 $\mu_k[:H']$ 仍通过 attention 依赖全部 $x_k$（包括被丢弃的 token）。这意味着 slice 方案保留了长期规划的上下文（丢弃 token 通过 attention 影响前 $H'$ 个 token 的预测），但只对实际执行部分计算 ratio。这也是 match 和 slice 两个方案的本质差异：
+
+- **Match**：短期规划，action tokens 间交互范围小（10 个 token），无截断
+- **Slice**：长期规划 + 局部 ratio，action tokens 间交互范围大（32 个 token），丢弃 token 提供规划上下文但不参与 ratio 计算
 
 注意：截断只影响 log_prob 的计算范围，不影响模型内部的 attention 计算。模型始终对全部 action tokens 执行 SDE denoising。
 
