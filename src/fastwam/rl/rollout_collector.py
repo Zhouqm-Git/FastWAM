@@ -136,6 +136,30 @@ class RolloutCollector:
             if cfg.rl.get("exec_horizon") is not None
             else None
         )
+        if self.action_horizon <= 0:
+            raise ValueError(f"`action_horizon` must be positive, got {self.action_horizon}.")
+        if self.replan_steps <= 0:
+            raise ValueError(f"`replan_steps` must be positive, got {self.replan_steps}.")
+        if self.action_horizon < self.replan_steps:
+            raise ValueError(
+                "`action_horizon` must be >= `replan_steps` so each rollout chunk "
+                f"can execute the configured {self.replan_steps} actions, got "
+                f"action_horizon={self.action_horizon}."
+            )
+        if self.exec_horizon is not None:
+            if self.exec_horizon <= 0:
+                raise ValueError(f"`exec_horizon` must be positive, got {self.exec_horizon}.")
+            if self.exec_horizon > self.action_horizon:
+                raise ValueError(
+                    "`exec_horizon` cannot exceed `action_horizon`, got "
+                    f"exec_horizon={self.exec_horizon}, action_horizon={self.action_horizon}."
+                )
+            if self.exec_horizon != self.replan_steps:
+                raise ValueError(
+                    "`exec_horizon` must equal `replan_steps` so ratio/log-prob coverage "
+                    "matches the executed action prefix exactly, got "
+                    f"exec_horizon={self.exec_horizon}, replan_steps={self.replan_steps}."
+                )
 
     def _next_inference_seed(self) -> Optional[int]:
         if self._seed_base is None:

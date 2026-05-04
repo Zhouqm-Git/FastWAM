@@ -21,7 +21,7 @@ from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcess
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.fs import ensure_dir
 from fastwam.utils.logging_config import get_logger
-from fastwam.utils.pytorch_utils import set_global_seed
+from fastwam.utils.pytorch_utils import optimizer_to, set_global_seed
 
 from .algorithms import assign_advantages, resolve_variant
 from .metric_logger import RLMetricLogger
@@ -89,6 +89,16 @@ def _set_rng_state(state: dict) -> None:
         random.setstate(state["random"])
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _move_optimizer_state_to_model_device(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module
+) -> torch.device:
+    """Move optimizer state tensors onto the same device as the model."""
+    model_device = next(model.parameters()).device
+    base_optimizer = getattr(optimizer, "optimizer", optimizer)
+    optimizer_to(base_optimizer, device=model_device)
+    return model_device
 
 
 class FastWAMRLTrainer:
@@ -390,21 +400,41 @@ class FastWAMRLTrainer:
             unwrapped.load_checkpoint(weights_path)
             logger.info("Resumed model weights from %s", weights_path)
         else:
-            # Fallback: locate weights by step-tag naming convention.
             step_tag = f"update_{self.global_step:06d}"
-            fallback = os.path.join(self.weights_dir, f"{step_tag}.pt")
-            if os.path.isfile(fallback):
+            fallback_candidates = []
+            resume_weights_dir = resume_dir.parent.parent / "weights"
+            fallback_candidates.append(resume_weights_dir / f"{step_tag}.pt")
+            fallback_candidates.append(Path(self.weights_dir) / f"{step_tag}.pt")
+
+            seen_fallbacks: set[Path] = set()
+            resolved_fallback = None
+            for fallback in fallback_candidates:
+                fallback = fallback.resolve()
+                if fallback in seen_fallbacks:
+                    continue
+                seen_fallbacks.add(fallback)
+                if fallback.is_file():
+                    resolved_fallback = fallback
+                    break
+
+            if resolved_fallback is not None:
                 unwrapped = self.accelerator.unwrap_model(self.model)
-                unwrapped.load_checkpoint(fallback)
-                logger.info("Resumed model weights from fallback %s", fallback)
+                unwrapped.load_checkpoint(str(resolved_fallback))
+                logger.info("Resumed model weights from fallback %s", resolved_fallback)
             else:
                 logger.warning(
                     "Resume weights_path missing or invalid (%s), "
-                    "fallback %s also absent.  Model weights come from "
-                    "the init checkpoint and may be stale.",
+                    "fallbacks under %s and %s are also absent. Model "
+                    "weights come from the init checkpoint and may be stale.",
                     weights_path,
-                    fallback,
+                    resume_weights_dir,
+                    self.weights_dir,
                 )
+
+        optimizer_device = _move_optimizer_state_to_model_device(
+            self.optimizer, self.accelerator.unwrap_model(self.model)
+        )
+        logger.info("Moved resumed optimizer state to device %s", optimizer_device)
 
         # ---- Restore RNG state (Fix #2, part 1) ----
         rng_state = trainer_state.get("rng_state")
