@@ -97,6 +97,7 @@ class WanContinuousFlowMatchScheduler:
         sigma: torch.Tensor,
         sigma_max: float = 0.1,
         generator: torch.Generator | None = None,
+        exec_horizon: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Flow-GSPO SDE sampling step with log-probability.
 
@@ -107,15 +108,15 @@ class WanContinuousFlowMatchScheduler:
           mu_tau = x_tau + [v_theta + sigma_tau^2/2 * (x_tau + (1-tau)*v_theta)] * delta
           Sigma_tau = sigma_tau^2 * delta * I
 
-        When sigma_max=0.1 is small, the score correction term is negligible:
-          mu_tau ≈ x_tau + v_theta * delta
-
         Args:
             model_output: Predicted velocity v_theta, shape [1, T, D].
             delta: sigma_{i+1} - sigma_i (negative scalar).
             sample: Current noisy sample x_t, shape [1, T, D].
             sigma: Current sigma_t (scalar, in [0,1]).
             sigma_max: SDE noise upper bound (default 0.1).
+            exec_horizon: If set, log_prob only covers the first exec_horizon
+                action steps (marginal transition log-density). Sampling still
+                operates on the full action sequence. None = use all steps.
 
         Returns:
             next_sample: Sampled x_{tau+delta}.
@@ -132,8 +133,12 @@ class WanContinuousFlowMatchScheduler:
         # sigma_tau = sigma_max * (1 - tau) = sigma_max * sigma
         sigma_tau = sigma_max * sigma.float()
 
-        # Deterministic mean: mu_tau = x_t + v_theta * delta  (simplified, sigma_max small)
-        mean = sample_f + model_output_f * delta
+        # Deterministic mean with score correction (paper eq.12):
+        # drift = v_theta + sigma_tau^2/2 * (x_tau + (1-tau)*v_theta)
+        # mu_tau = x_tau + drift * delta
+        score_correction = (sigma_tau ** 2 / 2.0) * (sample_f + (1.0 - tau) * model_output_f)
+        drift = model_output_f + score_correction
+        mean = sample_f + drift * delta
 
         # Noise scale: sigma_tau * sqrt(|delta|)
         abs_delta = (-delta).float()  # delta is negative, so |delta| = -delta
@@ -148,14 +153,24 @@ class WanContinuousFlowMatchScheduler:
         )
         next_sample = mean + std * noise
 
-        # log p(x_next | mean, std^2 * I) = -0.5 * ((x_next - mean)^2 / std^2).mean() - log(std) - 0.5*log(2pi)
-        # .mean() over all dimensions (not .sum()) so log-probs are comparable across chunk sizes
+        # log p(x_next | mean, std^2 * I): standard multivariate Gaussian log-density (paper eq.14)
+        # log N(x|mu, sigma^2*I) = -0.5 * ||x-mu||^2/sigma^2 - N*log(sigma) - N/2*log(2pi)
+        # where N = total number of elements (H * D for action block)
+        # When exec_horizon is set, only include the first exec_horizon action steps.
         if std.abs() < 1e-12:
             # sigma_max=0 degenerate case: deterministic step, log_prob=0
             log_prob = torch.tensor(0.0, device=sample.device, dtype=torch.float32)
         else:
             diff = (next_sample - mean) ** 2
-            log_prob = -0.5 * diff.mean() / (std ** 2) - torch.log(std) - 0.5 * math.log(2.0 * math.pi)
+            if exec_horizon is not None:
+                # Marginal log-density for executed action steps only
+                diff = diff[:, :exec_horizon, :]
+            num_elements = diff.numel()  # exec_horizon * D or H * D
+            log_prob = (
+                -0.5 * diff.sum() / (std ** 2)
+                - num_elements * torch.log(std)
+                - 0.5 * num_elements * math.log(2.0 * math.pi)
+            )
 
         return (
             next_sample.to(dtype=sample.dtype),

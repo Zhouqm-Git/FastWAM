@@ -33,7 +33,7 @@ EVALUATION:
   sigma_shift: null
   text_cfg_scale: 1.0
   negative_prompt: ""
-  rand_device: cpu
+  rand_device: cuda
   tiled: false
 
   # Optional external inputs

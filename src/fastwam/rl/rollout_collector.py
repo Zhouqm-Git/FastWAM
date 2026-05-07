@@ -6,6 +6,7 @@ replaces ODE denoising with SDE sampling + chain tracking.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 def _extract_sim_state(obs: dict) -> np.ndarray:
     """Build proprioceptive state from LIBERO observation."""
-    from libero.libero.utils.utils import quat2axisangle
+    from experiments.libero.libero_utils import quat2axisangle
 
     state = np.concatenate(
         (
@@ -116,6 +117,50 @@ class RolloutCollector:
         self._seed_base = None if cfg.get("seed") is None else int(cfg.seed)
         self._sample_counter = 0
 
+        # --- Ablation: action horizon & log-prob coverage ---
+        # rl.action_horizon overrides the prediction horizon passed to the model.
+        #   null  = use default (e.g., 32 from data.train.num_frames - 1)
+        #   int   = override to this value (e.g., 10 for predict=exec matching)
+        # rl.exec_horizon controls log_prob coverage for partial execution.
+        #   null  = log_prob covers all predicted actions
+        #   int   = log_prob only covers the first N actions (GR00T-style slicing)
+        rl_ah = cfg.rl.get("action_horizon")
+        if rl_ah is not None:
+            self.action_horizon = int(rl_ah)
+            logger.info(
+                "RL action_horizon override: %d (default was %d)",
+                self.action_horizon, action_horizon,
+            )
+        self.exec_horizon = (
+            int(cfg.rl.get("exec_horizon"))
+            if cfg.rl.get("exec_horizon") is not None
+            else None
+        )
+        if self.action_horizon <= 0:
+            raise ValueError(f"`action_horizon` must be positive, got {self.action_horizon}.")
+        if self.replan_steps <= 0:
+            raise ValueError(f"`replan_steps` must be positive, got {self.replan_steps}.")
+        if self.action_horizon < self.replan_steps:
+            raise ValueError(
+                "`action_horizon` must be >= `replan_steps` so each rollout chunk "
+                f"can execute the configured {self.replan_steps} actions, got "
+                f"action_horizon={self.action_horizon}."
+            )
+        if self.exec_horizon is not None:
+            if self.exec_horizon <= 0:
+                raise ValueError(f"`exec_horizon` must be positive, got {self.exec_horizon}.")
+            if self.exec_horizon > self.action_horizon:
+                raise ValueError(
+                    "`exec_horizon` cannot exceed `action_horizon`, got "
+                    f"exec_horizon={self.exec_horizon}, action_horizon={self.action_horizon}."
+                )
+            if self.exec_horizon != self.replan_steps:
+                raise ValueError(
+                    "`exec_horizon` must equal `replan_steps` so ratio/log-prob coverage "
+                    "matches the executed action prefix exactly, got "
+                    f"exec_horizon={self.exec_horizon}, replan_steps={self.replan_steps}."
+                )
+
     def _next_inference_seed(self) -> Optional[int]:
         if self._seed_base is None:
             return None
@@ -201,9 +246,11 @@ class RolloutCollector:
 
     def _get_libero_image(self, obs: dict) -> dict[str, np.ndarray]:
         """Extract images from LIBERO observation."""
-        imgs = {"image": obs["image"]}
-        if "wrist_image" in obs:
-            imgs["wrist_image"] = obs["wrist_image"]
+        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+        imgs = {"image": img}
+        if "robot0_eye_in_hand_image" in obs:
+            wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+            imgs["wrist_image"] = wrist_img
         return imgs
 
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
@@ -222,7 +269,7 @@ class RolloutCollector:
 
         Matches eval_libero_single.py behavior.
         """
-        from libero.libero.utils.utils import invert_gripper_action
+        from experiments.libero.libero_utils import invert_gripper_action
 
         action = self._denormalize_action(action)[0]  # [T, D]
 
@@ -241,6 +288,10 @@ class RolloutCollector:
         task_description: str,
         task_id: str,
         initial_state=None,
+        group_id: str = "",
+        reset_id: str = "",
+        initial_state_index: int = -1,
+        trajectory_id: str = "",
         max_steps: Optional[int] = None,
     ) -> TrajectoryData:
         """Run a complete trajectory in the environment.
@@ -251,6 +302,7 @@ class RolloutCollector:
         """
         if max_steps is None:
             max_steps = _get_max_steps(str(self.cfg.EVALUATION.task_suite_name))
+        trajectory_start_time = time.perf_counter()
 
         obs = self.env.reset()
         if initial_state is not None:
@@ -262,6 +314,7 @@ class RolloutCollector:
 
         chunks: list[ChunkData] = []
         pending_actions: list[list[float]] = []
+        first_chunk_seed: Optional[int] = None
 
         t = 0
         done = False
@@ -269,6 +322,10 @@ class RolloutCollector:
             if not pending_actions:
                 # Flow-GSPO: SDE sampling + chain tracking
                 model_input = self._obs_to_model_input(obs, task_description)
+                chunk_index = len(chunks)
+                chunk_seed = self._next_inference_seed()
+                if first_chunk_seed is None:
+                    first_chunk_seed = chunk_seed
                 result = self.model.infer_action_with_logprob(
                     prompt=None,
                     context=model_input["context"],
@@ -285,9 +342,10 @@ class RolloutCollector:
                         if self.cfg.EVALUATION.get("sigma_shift") is None
                         else float(self.cfg.EVALUATION.get("sigma_shift"))
                     ),
-                    seed=self._next_inference_seed(),
+                    seed=chunk_seed,
                     rand_device=str(self.cfg.EVALUATION.get("rand_device", "cpu")),
                     tiled=bool(self.cfg.EVALUATION.get("tiled", False)),
+                    exec_horizon=self.exec_horizon,
                 )
 
                 # Post-process actions for environment execution
@@ -295,6 +353,7 @@ class RolloutCollector:
                 pending_actions = list(actions[: self.replan_steps])
 
                 # Store chunk data
+                effective_horizon = self.exec_horizon if self.exec_horizon is not None else self.action_horizon
                 chunk = ChunkData(
                     obs_image=model_input["input_image"].cpu(),
                     obs_proprio=(
@@ -306,11 +365,23 @@ class RolloutCollector:
                     context_mask=model_input["context_mask"].cpu(),
                     chain=result["chain"].cpu(),
                     old_log_prob=result["log_prob"].cpu(),
-                    block_size=self.action_horizon * self.num_inference_steps,
+                    block_size=effective_horizon * self.num_inference_steps,
+                    exec_horizon=self.exec_horizon,
                     action=result["action"].cpu(),
                     chunk_rewards=[],
                     done=False,
                     task_id=task_id,
+                    group_id=group_id,
+                    reset_id=reset_id,
+                    initial_state_index=initial_state_index,
+                    trajectory_id=trajectory_id,
+                    chunk_index=chunk_index,
+                    env_step_start=t,
+                    env_step_end=t,
+                    rollout_seed=chunk_seed,
+                    rollout_time=time.perf_counter() - trajectory_start_time,
+                    task_suite_name=str(self.cfg.EVALUATION.task_suite_name),
+                    reward_components={},
                     task_description=task_description,
                 )
                 chunks.append(chunk)
@@ -322,6 +393,7 @@ class RolloutCollector:
             # Record reward to current chunk
             chunks[-1].chunk_rewards.append(float(reward))
             t += 1
+            chunks[-1].env_step_end = t
 
             if done:
                 chunks[-1].done = True
@@ -337,6 +409,14 @@ class RolloutCollector:
             chunks=chunks,
             trajectory_reward=trajectory_reward,
             success=success,
+            group_id=group_id,
+            reset_id=reset_id,
+            initial_state_index=initial_state_index,
+            trajectory_id=trajectory_id,
+            rollout_seed=first_chunk_seed,
+            rollout_time=time.perf_counter() - trajectory_start_time,
+            task_suite_name=str(self.cfg.EVALUATION.task_suite_name),
+            reward_components={"success": trajectory_reward},
         )
 
     def collect_group(
@@ -345,6 +425,9 @@ class RolloutCollector:
         task_id: str,
         group_size: int = 8,
         initial_state=None,
+        group_id: str = "",
+        reset_id: str = "",
+        initial_state_index: int = -1,
         max_steps: Optional[int] = None,
     ) -> RolloutBuffer:
         """Flow-GSPO: sample G trajectories for the same task.
@@ -353,11 +436,15 @@ class RolloutCollector:
             A_hat_i = (R_i - mean) / std
         """
         buffer = RolloutBuffer()
-        for _ in range(group_size):
+        for traj_idx in range(group_size):
             traj = self.collect_trajectory(
                 task_description=task_description,
                 task_id=task_id,
                 initial_state=initial_state,
+                group_id=group_id,
+                reset_id=reset_id,
+                initial_state_index=initial_state_index,
+                trajectory_id=f"{group_id or task_id}:traj_{traj_idx:03d}",
                 max_steps=max_steps,
             )
             buffer.add_trajectory(traj)

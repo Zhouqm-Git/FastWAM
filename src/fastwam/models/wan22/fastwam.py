@@ -1,5 +1,5 @@
 import math
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,16 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
+
+
+class ActionVideoKVCacheBundle(TypedDict):
+    """Reusable frozen video-side state for action log-prob recomputation."""
+
+    video_kv_cache: list[dict[str, torch.Tensor]]
+    video_seq_len: int
+    video_tokens_per_frame: int
+    action_seq_len: int
+    attention_mask: torch.Tensor
 
 
 class FastWAM(torch.nn.Module):
@@ -1100,6 +1110,7 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        exec_horizon: Optional[int] = None,
     ) -> dict[str, Any]:
         """Flow-GSPO action inference: SDE sampling with log-probability tracking.
 
@@ -1109,6 +1120,9 @@ class FastWAM(torch.nn.Module):
         Args:
             sigma_max: SDE noise upper bound. 0.0 = pure ODE (deterministic),
                 0.1 = OmniVLA-RL default. Controls exploration strength.
+            exec_horizon: If set, log_prob only covers the first exec_horizon
+                action steps. Sampling still operates on the full action_horizon.
+                None = use all action_horizon steps.
             (All other args same as infer_action.)
 
         Returns:
@@ -1254,6 +1268,7 @@ class FastWAM(torch.nn.Module):
                 sigma,
                 sigma_max,
                 generator=generator,
+                exec_horizon=exec_horizon,
             )
 
             latents_action = next_sample
@@ -1277,10 +1292,11 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         input_image: torch.Tensor,
         proprio: Optional[torch.Tensor] = None,
-        video_kv_cache=None,
+        video_kv_cache: Optional[ActionVideoKVCacheBundle] = None,
         sigma_max: float = 0.1,
         num_inference_steps: int = 10,
         sigma_shift: Optional[float] = None,
+        exec_horizon: Optional[int] = None,
     ) -> torch.Tensor:
         """Recompute log-prob from a stored denoising chain, WITH gradients.
 
@@ -1294,15 +1310,24 @@ class FastWAM(torch.nn.Module):
             context_mask: Context mask [1, L].
             input_image: Observation image [1, 3, H, W].
             proprio: Optional proprio [1, D] or [D].
-            video_kv_cache: Pre-computed video KV cache (optional, recomputed if None).
+            video_kv_cache: Optional cache bundle returned by
+                ``build_action_video_kv_cache()``. Raw KV-cache lists are not
+                accepted because they do not include the attention-mask metadata
+                required to reproduce the rollout-time computation exactly.
             sigma_max: SDE noise upper bound (must match rollout-time value).
             num_inference_steps: Number of denoising steps (must match rollout-time value).
             sigma_shift: Shift override for inference schedule.
+            exec_horizon: If set, log_prob only covers the first exec_horizon
+                action steps. The chain still uses full H for velocity computation.
+                None = use all action steps.
 
         Returns:
             Scalar log-prob with gradient w.r.t. action_expert parameters.
         """
         self.eval()
+        # chain may be [K+1, 1, H, D] (with batch dim) or [K+1, H, D]
+        if chain.ndim == 4 and chain.shape[1] == 1:
+            chain = chain.squeeze(1)
         K_plus_1 = chain.shape[0]
         if K_plus_1 < 2:
             raise ValueError(f"chain must have at least 2 entries (noise + result), got {K_plus_1}")
@@ -1317,51 +1342,53 @@ class FastWAM(torch.nn.Module):
 
         # Recompute video KV cache if not provided
         if video_kv_cache is None:
-            first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image)
-            fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
-
-            if proprio is not None:
-                ctx, ctx_mask = self._append_proprio_to_context(context, context_mask, proprio)
-            else:
-                ctx, ctx_mask = context, context_mask
-
-            timestep_video = torch.zeros(
-                (first_frame_latents.shape[0],),
-                dtype=first_frame_latents.dtype,
-                device=self.device,
-            )
-            video_pre = self.video_expert.pre_dit(
-                x=first_frame_latents,
-                timestep=timestep_video,
-                context=ctx,
-                context_mask=ctx_mask,
-                action=None,
-                fuse_vae_embedding_in_latents=fuse_flag,
-            )
-            video_seq_len = int(video_pre["tokens"].shape[1])
-            attention_mask = self._build_mot_attention_mask(
-                video_seq_len=video_seq_len,
+            cache_bundle = self.build_action_video_kv_cache(
+                input_image=input_image,
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
                 action_seq_len=chain.shape[1],
-                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-                device=video_pre["tokens"].device,
             )
-            video_kv_cache = self.mot.prefill_video_cache(
-                video_tokens=video_pre["tokens"],
-                video_freqs=video_pre["freqs"],
-                video_t_mod=video_pre["t_mod"],
-                video_context_payload={
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
-                },
-                video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
-            )
+            video_kv_cache = cache_bundle["video_kv_cache"]
+            video_seq_len = int(cache_bundle["video_seq_len"])
+            attention_mask = cache_bundle["attention_mask"]
+        elif isinstance(video_kv_cache, dict):
+            cache_bundle: ActionVideoKVCacheBundle = video_kv_cache
+            required_keys = {
+                "video_kv_cache",
+                "video_seq_len",
+                "video_tokens_per_frame",
+                "action_seq_len",
+                "attention_mask",
+            }
+            missing_keys = sorted(required_keys - set(cache_bundle.keys()))
+            if missing_keys:
+                raise ValueError(
+                    "Incomplete `video_kv_cache` bundle: missing keys "
+                    f"{missing_keys}. Use `build_action_video_kv_cache()` to create it."
+                )
+            video_kv_cache = cache_bundle["video_kv_cache"]
+            video_seq_len = int(cache_bundle["video_seq_len"])
+            expected_action_seq_len = int(cache_bundle["action_seq_len"])
+            if expected_action_seq_len != int(chain.shape[1]):
+                raise ValueError(
+                    "Mismatched `video_kv_cache` bundle: "
+                    f"bundle action_seq_len={expected_action_seq_len}, chain action_seq_len={int(chain.shape[1])}."
+                )
+            attention_mask = cache_bundle["attention_mask"]
+            expected_total_seq_len = video_seq_len + expected_action_seq_len
+            if attention_mask.shape != (expected_total_seq_len, expected_total_seq_len):
+                raise ValueError(
+                    "Mismatched `video_kv_cache` attention_mask shape: "
+                    f"got {tuple(attention_mask.shape)}, expected "
+                    f"({expected_total_seq_len}, {expected_total_seq_len})."
+                )
         else:
-            video_seq_len = video_kv_cache[0]["k"].shape[1]
-            attention_mask = self._build_mot_attention_mask(
-                video_seq_len=video_seq_len,
-                action_seq_len=chain.shape[1],
-                video_tokens_per_frame=int(video_seq_len),
-                device=self.device,
+            raise TypeError(
+                "`video_kv_cache` must be either None or a cache bundle returned by "
+                "`build_action_video_kv_cache()`. Raw KV-cache lists are no longer "
+                "accepted because they do not carry enough metadata to reconstruct "
+                "the correct attention mask."
             )
 
         # Build inference schedule
@@ -1399,23 +1426,100 @@ class FastWAM(torch.nn.Module):
             # Flow-GSPO transition log-prob
             sigma = step_t.float() / float(self.infer_action_scheduler.num_train_timesteps)
             sigma_tau = sigma_max * sigma
-            # mean = x_tau + v_theta * delta  (simplified for small sigma_max)
-            mean = chains_prev[i].detach() + pred_velocity * step_delta
+            tau = 1.0 - sigma
+
+            # Score correction (paper eq.12):
+            # drift = v_theta + sigma_tau^2/2 * (x_tau + (1-tau)*v_theta)
+            # mu_tau = x_tau + drift * delta
+            score_correction = (sigma_tau ** 2 / 2.0) * (
+                chains_prev[i].detach() + (1.0 - tau) * pred_velocity
+            )
+            drift = pred_velocity + score_correction
+            mean = chains_prev[i].detach() + drift * step_delta
             std = sigma_tau * torch.sqrt((-step_delta).float())
 
             if std.abs() < 1e-12:
                 log_probs.append(torch.tensor(0.0, device=self.device, dtype=torch.float32))
             else:
-                # log N(x_next | mean, std^2 * I) averaged over all dimensions
+                # log N(x_next | mean, std^2 * I): standard multivariate Gaussian log-density (paper eq.14)
                 diff = (chains_next[i].detach() - mean) ** 2
+                if exec_horizon is not None:
+                    # Marginal log-density for executed action steps only
+                    diff = diff[:, :exec_horizon, :]
+                num_elements = diff.numel()  # exec_horizon * D or H * D
                 log_prob = (
-                    -0.5 * diff.mean() / (std ** 2)
-                    - torch.log(std)
-                    - 0.5 * math.log(2.0 * math.pi)
+                    -0.5 * diff.sum() / (std ** 2)
+                    - num_elements * torch.log(std)
+                    - 0.5 * num_elements * math.log(2.0 * math.pi)
                 )
                 log_probs.append(log_prob)
 
         return sum(log_probs)  # has gradient w.r.t. action_expert parameters
+
+    @torch.no_grad()
+    def build_action_video_kv_cache(
+        self,
+        input_image: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        action_seq_len: int = 1,
+    ) -> ActionVideoKVCacheBundle:
+        """Build reusable video-side cache bundle for action log-prob recomputation."""
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        context = context.to(device=self.device, dtype=self.torch_dtype)
+        context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        if proprio is not None:
+            ctx, ctx_mask = self._append_proprio_to_context(context, context_mask, proprio)
+        else:
+            ctx, ctx_mask = context, context_mask
+
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=ctx,
+            context_mask=ctx_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        video_tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+        return {
+            "video_kv_cache": video_kv_cache,
+            "video_seq_len": video_seq_len,
+            "video_tokens_per_frame": video_tokens_per_frame,
+            "action_seq_len": int(action_seq_len),
+            "attention_mask": attention_mask,
+        }
 
     @torch.no_grad()
     def infer(
@@ -1468,7 +1572,7 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:

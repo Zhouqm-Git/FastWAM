@@ -1,717 +1,685 @@
-# FastWAM + Flow-GSPO RL: Project Context, Engineering Plan, and Borrowed Design Notes
+# FastWAM + Flow-GSPO RL: Implementation Report
 
-## 1. Project Summary
-
-本项目的目标是：
-
-- 以 `FastWAM` 作为基座；
-- 冻结 `video DiT / world representation`；
-- 只对 `action head` 及其必要的 action-side modules 做在线 RL；
-- 采用 `Flow-GSPO` 系列方法完成三组消融：
-  - `Exp-1`: 原版 `block-level Flow-GSPO`
-  - `Exp-2`: `trajectory-level advantage + chunk-level ratio`
-  - `Exp-3`: `trajectory-level advantage + trajectory-level ratio`
-
-当前阶段的任务不是证明某一个单独主方法，而是把三种实验都接入同一套可维护、可扩展、可监控的 RL infra。
+本文档是对当前 FastWAM RL 训练系统的确定性描述。所有内容均与代码实现一一对应，不包含假设、设想或未来计划。
 
 ---
 
-## 2. One-Sentence Problem Definition
+## 1. Project Overview
 
-`OmniVLA-RL` 已经提供了 `flow action block` 的随机化采样与 `block likelihood / ratio` 建模方式，但 `FastWAM` 面临的是 `multi-chunk closed-loop control`，因此必须重新定义 reward/advantage 的归因单位，并将三种 ablation 放入统一的 rollout-train pipeline。
+以 `FastWAM` 为基座，冻结 video DiT 与 world representation，只对 action-side modules 做在线 RL，采用 Flow-GSPO 方法完成消融实验。
 
----
+两个正交的消融维度：
 
-## 3. Hard Constraints
+**维度 A — Ratio 计算粒度**（`rl.variant`）：
+- `traj_chunk`：trajectory-level advantage + chunk-level ratio
+- `traj_traj`：trajectory-level advantage + trajectory-level ratio
 
-### 3.1 Model-side constraint
+**维度 B — Action Chunk 执行策略**（`rl.action_horizon` / `rl.exec_horizon`）：
+- `match`（predict=exec）：将 action_horizon 缩短为 replan_steps，预测与执行一致
+- `slice`（predict>exec）：保持原始 action_horizon=32 预测，log_prob 只覆盖实际执行的前 N 步
 
-训练时优先冻结：
-
-- `video_expert`
-- `VAE`
-- `text_encoder`
-- world-side representation path
-
-第一阶段只优化：
-
-- `action_expert`
-- 必要时的 `proprio_encoder`
-- 必要时的少量 `MoT` / action-side adapter / LoRA
-
-原因：
-
-- 避免 sparse reward 直接破坏 world representation；
-- 使实验结论聚焦于 `WAM representation + action-head RL`；
-- 降低 credit assignment 与 representation drift 耦合。
-
-### 3.2 Algorithm-side constraint
-
-三个实验必须共用：
-
-- 同一套 rollout 数据结构；
-- 同一套 `collect -> assign advantage -> compute ratio -> optimize -> log` 框架；
-- 同一入口脚本与同一配置系统。
-
-不允许为每个实验复制一份 trainer 或 rollout 代码。
-
-### 3.3 Infrastructure-side constraint
-
-代码组织必须优先考虑：
-
-- 简洁；
-- 层次清晰；
-- 便于在集群上扩展；
-- 后续可自然升级到多进程 / async rollout。
+交叉后共 4 组实验。所有实验共用同一套 rollout 数据结构、trainer 主循环、checkpoint 机制和 logging 系统。
 
 ---
 
-## 4. Algorithmic Context
+## 2. Model Architecture & Trainable Scope
 
-### 4.1 What is inherited from OmniVLA-RL
+### 2.1 FastWAM 模型结构
 
-可直接继承的部分：
+```
+text_encoder → context embeddings
+                     │
+              proprio_encoder (nn.Linear)
+                     │  将机器人状态拼接到 context
+                     ▼
+         ┌───────────┴───────────┐
+         │                       │
+   video_expert             action_expert
+   (Wan2.2 DiT)             (ActionDiT)
+         │                       │
+    video tokens           action tokens
+         │                       │
+         └───────────┬───────────┘
+                     │
+                    MoT
+            (Mixture-of-Transformers)
+         共享 self-attention + 各自 FFN
+```
 
-- 将 flow matching 的 ODE 改写为 SDE；
-- 每个 denoising transition 的高斯形式；
-- `action block likelihood` 的定义；
-- `block-size normalized importance ratio`。
+- **video_expert**：Wan2.2 视频 DiT，负责从图像提取 world representation。始终冻结。
+- **action_expert（ActionDiT）**：独立的 diffusion transformer，输入为 noisy action tokens + timestep + context，输出 flow velocity prediction $v_\theta$。包含 action_encoder、time_embedding、time_projection（6 路 adaLN）、DiTBlocks、head（Linear → action_dim）。
+- **MoT（Mixture-of-Transformers）**：将 video 和 action 两个 expert 的 token 拼接，做统一 self-attention，然后拆分回各自分支执行独立 FFN。推理时使用 KV cache：video 分支只做一次 prefill，后续每个 denoising step 只重算 action 分支。
+- **proprio_encoder**：单层 `nn.Linear(proprio_dim, text_dim)`，将机器人本体感知（关节角度、夹爪状态）投影到文本嵌入空间，拼接到 context 末尾。
 
-形式上，单个 action block
+### 2.2 Trainable Scope
 
-$$
-A_t = [a_{t,0}, \dots, a_{t,H-1}]
-$$
+通过 `rl.trainable_scope` 配置，三个确定选项：
 
-的似然为
+| Scope | 可训练模块 | 说明 |
+|---|---|---|
+| `action_expert_only` | ActionDiT 全部参数 + proprio_encoder | 最保守策略，只调动作预测能力 |
+| `action_expert_and_mot` | ActionDiT + MoT action 分支 + proprio_encoder | 额外允许 attention 层学习 video→action 的信息提取 |
+| `full` | 全部参数 | 连 video_expert 也一起调（一般不使用） |
 
-$$
-\pi_\theta(A_t \mid z_t)
-=
-\prod_{\tau=0}^{K-1}
-p_\theta(A_t^{\tau+\delta} \mid A_t^\tau, z_t),
-$$
-
-对应 chunk-level ratio 为
-
-$$
-\rho_{i,t}^{\text{chunk}}
-=
-\left(
-\frac{\pi_\theta(A_{i,t}\mid z_{i,t})}
-{\pi_{\theta_{\text{old}}}(A_{i,t}\mid z_{i,t})}
-\right)^{1/(HK)}.
-$$
-
-这里：
-
-- `H` 是 action horizon；
-- `K` 是 denoising steps。
-
-### 4.2 What must be changed for FastWAM
-
-`OmniVLA-RL` 的原版 advantage 是：
-
-- 同一个状态下采样多个候选 action blocks；
-- 用 block reward 做 group normalization。
-
-这在 `FastWAM` 的长程闭环任务里不够，因为：
-
-- success 往往在多个 chunks 之后才出现；
-- 中间 block 可能没有稳定的局部 reward；
-- 不同 trajectory 中间 observation 很快分叉。
-
-因此 `FastWAM` 必须显式区分：
-
-- `likelihood unit`
-- `ratio unit`
-- `reward / advantage unit`
+实现方式（`trainer.py:_configure_trainable_scope`）：先将整个 model 设为 `eval()` + `requires_grad_(False)`，再按 scope 选择性地 `train()` + `requires_grad_(True)` 对应子模块。
 
 ---
 
-## 5. Three Required Ablations
+## 3. Algorithm: Flow-GSPO on FastWAM
 
-### 5.1 Exp-1: Original Block-Level Flow-GSPO
+本节分为两部分：
+- **3.1 - 3.4**：保持与 OmniVLA-RL 论文中 stochastic flow matching / transition likelihood / block likelihood ratio 的核心形式一致
+- **3.5 - 3.6**：针对 FastWAM + LIBERO sparse terminal reward 做 trajectory-level 改造；这是当前代码的确定实现，不是论文原版 block-level reward formulation
 
-定义：
+### 3.1 Flow ODE → SDE
 
-- reward / advantage: `block-level`
-- ratio: `chunk-level`
+将确定性 ODE denoising 改为随机 SDE（论文 eq.10-11）。从纯噪声 $A_t^0$ 出发，经过 $K$ 步 Euler-Maruyama 离散化：
 
-用途：
+$$A_t^{\tau+\delta} = A_t^\tau + \left[v_\theta + \frac{\sigma_\tau^2}{2}(A_t^\tau + (1-\tau)v_\theta)\right]\delta + \sigma_\tau\sqrt{|\delta|}\,\epsilon$$
 
-- 作为原论文迁移基线；
-- 验证 `FastWAM action head` 是否可直接受益于原始 Flow-GSPO。
+其中：
+- $\tau = 1 - \sigma$，$\sigma$ 为当前 noise level，从 1 递减到 0
+- $\sigma_\tau = \sigma_{\max} \cdot \sigma$，线性噪声调度
+- $\delta = \sigma_{i+1} - \sigma_i$（负值），实现中噪声项使用 $|\delta| = -\delta$
+- $v_\theta$ 为模型预测的 velocity
 
-局限：
+### 3.2 Transition Probability
 
-- 依赖 block reward；
-- 对纯 terminal success 任务可能不足。
+每一步 SDE transition 服从各向同性高斯（论文 eq.12-13）：
 
-### 5.2 Exp-2: Trajectory-Level Advantage + Chunk-Level Ratio
+$$p_\theta(A_t^{\tau+\delta} \mid A_t^\tau, s_t) \sim \mathcal{N}(\mu_\tau, \sigma_\tau^2|\delta| \cdot I)$$
 
-定义：
+其中均值：
 
-- reward / advantage: `trajectory-level`
-- ratio: `chunk-level`
+$$\mu_\tau = A_t^\tau + \left[v_\theta + \frac{\sigma_\tau^2}{2}(A_t^\tau + (1-\tau)v_\theta)\right]\delta$$
 
-这是最重要的实验。
+代码实现位置：
+- Rollout 阶段：`scheduler_continuous.py:step_sde_with_logprob`
+- 训练阶段（带梯度）：`fastwam.py:compute_logprob_from_chain`
 
-形式上，对同 task / same reset distribution 的 $G$ 条 trajectory，
+两处使用完全相同的 drift 公式，包含完整的 score correction 项。
 
-$$
-\hat{A}_i^{\text{traj}}
-=
-\frac{R_i^{\text{traj}}-\mu_R}{\sigma_R+\epsilon},
-$$
+### 3.3 Log-Probability
 
-并将其分配给每个 chunk：
+单个 transition 的 log-density 使用标准多元高斯密度（论文 eq.14）：
 
-$$
-\hat{A}_{i,t} = \hat{A}_i^{\text{traj}}
-$$
+$$\log p_\theta = -\frac{1}{2\sigma_\tau^2|\delta|}\sum_{h,d}(A_{t,h,d}^{\tau+\delta} - \mu_{\tau,h,d})^2 - N\log(\sigma_\tau\sqrt{|\delta|}) - \frac{N}{2}\log(2\pi)$$
 
-或
+其中 $N = H \times D$（action_horizon × action_dim）为 action block 的总维度。**使用 sum over 所有维度**，不使用 mean。
 
-$$
-\hat{A}_{i,t} = \gamma^{N_i-t}\hat{A}_i^{\text{traj}}.
-$$
+**Log-prob 截断**：当设置 `exec_horizon` 时，$N$ 变为 `exec_horizon × D`，`diff` 只取前 `exec_horizon` 个 action 维度。这是对转移概率的边际化（见 Section 5 的数学分析）。
 
-用途：
+Action block 的完整 log-likelihood 为所有 $K$ 步 transition 之和：
 
-- 解决长程 credit assignment；
-- 保留 chunk-level clipping 的稳定性。
+$$\log \pi_\theta(A_t \mid s_t) = \sum_{\tau=0}^{K-1}\log p_\theta(A_t^{\tau+\delta} \mid A_t^\tau, s_t)$$
 
-### 5.3 Exp-3: Trajectory-Level Advantage + Trajectory-Level Ratio
+代码：`infer_action_with_logprob` 中 `total_log_prob = sum(log_probs_per_step)`。
 
-定义：
+### 3.4 Importance Ratio
 
-- reward / advantage: `trajectory-level`
-- ratio: `trajectory-level`
+**Chunk-level ratio**（Exp-2，论文 eq.15）：
 
-形式上，
+$$s_{i,t}(\theta) = \exp\left(\frac{1}{HK}\left[\log\pi_\theta(A_{i,t}|s_{i,t}) - \log\pi_{\theta_{\text{old}}}(A_{i,t}|s_{i,t})\right]\right)$$
 
-$$
-\rho_i^{\text{traj}}
-=
-\left(
-\frac{
-\prod_t \pi_\theta(A_{i,t}\mid z_{i,t})
-}{
-\prod_t \pi_{\theta_{\text{old}}}(A_{i,t}\mid z_{i,t})
+代码：`objectives.py:_compute_chunk_level_objective`
+```python
+log_ratio = (new_log_prob - old_log_prob) / float(chunk.block_size)
+ratio = torch.exp(log_ratio)  # block_size = H * K
+```
+
+**Trajectory-level ratio**（Exp-3）：
+
+$$s_i(\theta) = \exp\left(\frac{1}{\sum_t HK}\sum_{c}\left[\log\pi_\theta(A_{i,c}|s_{i,c}) - \log\pi_{\theta_{\text{old}}}(A_{i,c}|s_{i,c})\right]\right)$$
+
+即对所有 chunks 的 log_prob 求和后除以总 block_size。代码：`objectives.py:_compute_trajectory_level_objective`
+```python
+log_ratio = (new_total - old_total) / total_block_size  # total_block_size = C * H * K
+```
+
+### 3.5 Advantage
+
+当前实现对两个 variant 都采用 **trajectory-level** group advantage normalization。也就是说，`traj_chunk` 与 `traj_traj` 的 advantage 定义完全相同；两者的区别只在 importance ratio 与 surrogate objective 的聚合单位。
+
+对同一 task、同一 reset state 采样的 $G$ 条 trajectory，使用 trajectory terminal reward $R_i \in \{0, 1\}$（LIBERO sparse success reward）：
+
+$$\hat{A}_i = \frac{R_i - \mu_R}{\sigma_R + \epsilon}$$
+
+**Uniform assignment**（默认）：
+
+$$\hat{A}_{i,t} = \hat{A}_i \quad \forall t$$
+
+**Temporal decay assignment**（可选，`rl.trajectory_assignment=temporal_decay`）：
+
+$$\hat{A}_{i,t} = \gamma^{N_i - t}\hat{A}_i$$
+
+零方差过滤：若 group 内所有 trajectory reward 相同（全 success 或全 failure），则整组 advantage 置零，不参与训练。
+
+代码：`advantages.py:compute_gspo_trajectory_advantages` 和 `compute_gspo_trajectory_decay_advantages`。
+
+### 3.6 Objective
+
+Clipped surrogate + KL 正则保持 GSPO 形式，但当前代码有两个具体实例化版本：
+
+- **`traj_chunk`**：对每个 chunk 分别计算 ratio / clip / KL，再对所有有效 chunks 取均值
+- **`traj_traj`**：先在 trajectory 内聚合 log_prob，再对每条有效 trajectory 计算 ratio / clip / KL，并对所有有效 trajectories 取均值
+
+因此，下式更适合作为 `traj_traj` 的抽象写法；`traj_chunk` 与它的唯一区别在于 surrogate / KL 的平均单位从 trajectory 换成 chunk。
+
+$$\mathcal{L}(\theta) = -\frac{1}{G}\sum_i\left[\min\left(s_i\hat{A}_i,\;\text{clip}(s_i, 1-\varepsilon, 1+\varepsilon)\hat{A}_i\right) - \beta\,D_{\text{KL}}\right]$$
+
+KL 近似：
+
+$$D_{\text{KL}} \approx s - 1 - \log s = \exp(\log\_ratio) - 1 - \log\_ratio$$
+
+代码：`objectives.py`，其中 `clip_range` 对应 $\varepsilon$，`kl_coef` 对应 $\beta$。
+
+**当前实现细节**：
+
+- `traj_chunk` 采用 **per-chunk backward**：每个 chunk 单独重算 `new_log_prob`，立即构造 `micro_loss = -(objective - kl_coef * kl) / n_valid`，并通过 trainer 传入的 `backward_fn=accelerator.backward` 立刻回传。因此显存峰值近似受单个 chunk 的计算图支配。
+- `traj_traj` 采用 **两遍式实现**：
+  1. **Pass 1 (`torch.no_grad`)**：对每条 trajectory 的所有 chunks 计算 detached `new_log_prob`，聚合 trajectory `log_ratio / ratio / objective / KL`，并解析求出 $\frac{\partial L}{\partial \log ratio}$；
+  2. **Pass 2（带梯度）**：逐 chunk 重算 `new_log_prob`，调用 `backward_fn(chunk_coeff * new_log_prob)`，每个 chunk 的计算图回传后立即释放。
+- PPO clipping 的梯度分支判定使用 `clip_branch_active(ratio, advantage, clip_range)`，**显式考虑 advantage 符号**。因此在 `A < 0` 时，只有 `ratio < 1-\varepsilon` 才视为 clipped branch 激活。
+- `clip_fraction` 保持 PPO 常见定义：统计 **ratio 超出 clip 区间的比例**；另外额外记录 `clip_branch_active_fraction`，表示真正进入 clipped surrogate 分支的比例。
+
+---
+
+## 4. Ablation Experiments
+
+### 4.1 维度 A：Ratio 计算粒度
+
+**`traj_chunk`**：
+- Advantage：trajectory-level group normalization（uniform assignment）
+- Ratio：per-chunk，每 chunk 独立计算 $\exp(\frac{\log\pi_\theta - \log\pi_{\theta_{\text{old}}}}{HK})$
+- Objective：对每个有非零 advantage 的 chunk 独立做 clipped surrogate + KL
+
+特点：advantage 与 `traj_traj` 完全相同，区别仅在于 ratio / clipping / KL 仍保留 chunk 级别，保留更细粒度的优化信号。
+
+**`traj_traj`**：
+- Advantage：trajectory-level group normalization（与 traj_chunk 相同）
+- Ratio：per-trajectory，对所有 chunks 的 log_prob 求和后归一化
+- Objective：对每条有非零 advantage 的 trajectory 做一次 clipped surrogate + KL
+
+特点：与 `traj_chunk` 的唯一区别是 ratio / objective aggregation 也提升到 trajectory 级别，使 reward / advantage / ratio 三者单位完全统一。
+
+### 4.2 维度 B：Action Chunk 执行策略
+
+**问题背景**：FastWAM 模型预训练时预测 $H=32$ 个 action step，但实际执行时只取前 `replan_steps=10` 步后即重新规划。这意味着 $32 - 10 = 22$ 个预测的 action 从未在环境中执行，不贡献 reward。
+
+在 GSPO 的 importance ratio 中，`log_prob` 对所有 $H \times K$ 个维度求和。若包含未执行的 action，ratio 会被不相关的概率变化主导——策略可能只改变了被丢弃部分的分布，但 ratio 仍产生大幅偏移，触发不必要的 clipping。
+
+**方案 match（predict=exec）**：将 `action_horizon` 从 32 缩短为 10，模型预测 10 步，执行 10 步。预测与执行完全一致，log_prob 自然覆盖所有 action，无需截断。ActionDiT 的 `action_encoder`、DiTBlock、`head` 均为逐 token 操作，RoPE 缓存预计算至 1024，完全支持 seq_len=10。
+
+**方案 slice（predict>exec）**：保持 `action_horizon=32`，但 log_prob 只对前 `exec_horizon=10` 个 action 维度求和。采样过程仍对全部 32 个 action 执行 SDE denoising（因为 self-attention 需要），但 ratio 计算只考虑实际执行的子集。此方案参考 RLinf 的 GR00T 实现。
+
+### 4.3 完整实验矩阵
+
+| 实验编号 | variant | action_horizon | exec_horizon | 说明 |
+|---|---|---|---|---|
+| Exp-2a | `traj_chunk` | 10 (match) | null | predict=exec=10, chunk ratio |
+| Exp-2b | `traj_chunk` | 32 (default) | 10 (slice) | predict=32 exec=10, sliced log_prob, chunk ratio |
+| Exp-3a | `traj_traj` | 10 (match) | null | predict=exec=10, trajectory ratio |
+| Exp-3b | `traj_traj` | 32 (default) | 10 (slice) | predict=32 exec=10, sliced log_prob, trajectory ratio |
+
+启动命令：
+```bash
+# Exp-2a: match + chunk ratio
+python scripts/train_rl.py EVALUATION.task_suite_name=libero_spatial \
+  rl.variant=traj_chunk rl.action_horizon=10 rl.exec_horizon=null ckpt=<pt>
+
+# Exp-2b: slice + chunk ratio
+python scripts/train_rl.py EVALUATION.task_suite_name=libero_spatial \
+  rl.variant=traj_chunk rl.action_horizon=null rl.exec_horizon=10 ckpt=<pt>
+
+# Exp-3a / Exp-3b: 同上，改 rl.variant=traj_traj
+```
+
+### 4.4 Block-1 为何被移除
+
+原 Block-1（block-level advantage + chunk-level ratio）已被移除。原因：LIBERO 只提供 sparse terminal reward（0/1 success），所有中间 chunk 的 `chunk_rewards` 全为 0，只有 terminal chunk 可能有 reward。这导致 block-level group normalization 对绝大多数 chunk 产生零方差 group，advantage 全为 0，无法提供有效的梯度信号。
+
+---
+
+## 5. Reward Design & Action Chunk Analysis
+
+### 5.1 Reward
+
+LIBERO 环境只提供 sparse terminal reward：
+
+$$R = \begin{cases}1.0 & \text{task success (done=True)}\\0.0 & \text{otherwise}\end{cases}$$
+
+无中间 step reward、progress reward 或 alignment reward。Trajectory-level advantage 只在 group 内存在成功/失败混合时才有非零值。
+
+### 5.2 Action Chunk Partial Execution 问题
+
+FastWAM 的 action chunking 机制：
+
+```
+模型预测: [a_0, a_1, ..., a_9, a_10, ..., a_31]  ← H=32 步
+实际执行: [a_0, a_1, ..., a_9]                     ← replan_steps=10 步
+丢弃:                         [a_10, ..., a_31]    ← 22 步从不执行
+```
+
+在 Flow-GSPO 中，importance ratio 为：
+
+$$s = \exp\left(\frac{1}{HK}\sum_{k,h}\log\frac{p_\theta(x^{k,h})}{p_{\theta_{\text{old}}}(x^{k,h})}\right)$$
+
+其中 $H=32$，但只有前 10 步的 action 影响环境 reward。后 22 步的概率变化会干扰 ratio 信号。
+
+**对比其他实现**：
+- OmniVLA-RL：$H=16$，执行全部 16 步，不存在此问题
+- RLinf FlowPolicy（pi_0）：预测步数 = 执行步数，不存在此问题
+- RLinf GR00T：`action_horizon=16`（内部预测），`action_chunk=4`（实际输出），log_prob 显式切片到 `action_chunk` 维度，与方案 slice 一致
+
+### 5.3 Attention 因果性与截断的理论分析
+
+SDE 每步的均值为 $\mu_k = x_k + \text{drift}(v_\theta(x_k, \tau), \delta)$，其中 $v_\theta$ 通过 attention 计算。$\mu_k[h]$ 依赖哪些 token 取决于 attention 的因果性。
+
+**Causal attention**（如 OmniVLA-RL）：$v_\theta[h]$ 只依赖 $x_k[:h+1]$。当 $h < H'$ 时，$v_\theta[h]$ 不受 $x_k[H':]$ 影响，$\mu_k[:H']$ 只由 $x_k[:H']$ 决定。因此 match 和 slice 产生**完全一致的 log_prob**，截断无意义。
+
+**Bidirectional attention**（FastWAM）：$v_\theta[h]$ 依赖 $x_k[:H]$（全部 token）。即使 $h < H'$，$\mu_k[h]$ 仍通过 self-attention 依赖 $x_k[H':]$。因此 match 和 slice 产生**不同的 log_prob**，是本质不同的计算。
+
+FastWAM 的 attention mask（`fastwam.py:404`）：
+
+```python
+# action -> action: 全连接 bidirectional self-attention
+mask[video_seq_len:, video_seq_len:] = True
+```
+
+每层 MoT 将 action tokens 与 video KV cache 拼接（`mot.py:426-433`）：
+
+```python
+k_cat = torch.cat([k_video, k_action], dim=1)  # video + 全部 action keys
+mixed = self._mixed_attention(q_cat=q_action, k_cat=k_cat, v_cat=v_cat, ...)
+```
+
+| | Causal (OmniVLA-RL) | Bidirectional (FastWAM) |
+|---|---|---|
+| $v_\theta[h]$ 依赖范围 | $x_k[:h+1]$ | $x_k[:H]$ |
+| 截断后 $\mu_k[:H']$ | 只依赖 $x_k[:H']$ | 依赖**全部** $x_k$ |
+| match vs slice | 完全等价 | **不同** |
+| 截断是否有意义 | 无 | 有 |
+
+### 5.4 Log-prob 截断的数学基础
+
+SDE 每步的转移概率为各向同性高斯：
+
+$$p(x_{k+1} | x_k) = \mathcal{N}(x_{k+1};\, \mu_k,\, \sigma_k^2 I)$$
+
+协方差矩阵为 $\sigma_k^2 I$（对角），log density 按维度独立分解：
+
+$$\log p(x_{k+1} | x_k) = \sum_{h=1}^{H}\sum_{d=1}^{D}\left[-\frac{(x_{k+1}[h,d]-\mu_k[h,d])^2}{2\sigma_k^2} - \log\sigma_k - \frac{1}{2}\log 2\pi\right]$$
+
+截断到前 $H'$ 个 action 等价于取边际转移 log density：
+
+$$\log p(x_{k+1}[\,:H',:\,] | x_k) = \sum_{h=1}^{H'}\sum_{d=1}^{D}\left[-\frac{(x_{k+1}[h,d]-\mu_k[h,d])^2}{2\sigma_k^2} - \log\sigma_k - \frac{1}{2}\log 2\pi\right]$$
+
+这是合法的边际化操作（对角协方差保证各维度独立），不是近似。
+
+在 FastWAM 的 bidirectional attention 下，截断的 $\mu_k[:H']$ 仍通过 attention 依赖全部 $x_k$（包括被丢弃的 token）。这意味着 slice 方案保留了长期规划的上下文（丢弃 token 通过 attention 影响前 $H'$ 个 token 的预测），但只对实际执行部分计算 ratio。这也是 match 和 slice 两个方案的本质差异：
+
+- **Match**：短期规划，action tokens 间交互范围小（10 个 token），无截断
+- **Slice**：长期规划 + 局部 ratio，action tokens 间交互范围大（32 个 token），丢弃 token 提供规划上下文但不参与 ratio 计算
+
+注意：截断只影响 log_prob 的计算范围，不影响模型内部的 attention 计算。模型始终对全部 action tokens 执行 SDE denoising。
+
+---
+
+## 6. Observation Mismatch Analysis
+
+在 multi-chunk closed-loop control 中，不同 trajectory 的中间 observation 很快分叉。但 observation mismatch 不破坏 policy gradient 正确性：
+
+$$\frac{p_\theta(\tau)}{p_{\theta_{\text{old}}}(\tau)} = \prod_t\frac{\pi_\theta(A_t|s_t)}{\pi_{\theta_{\text{old}}}(A_t|s_t)}$$
+
+环境转移项在 ratio 中抵消。因此：
+
+- 每个 chunk 的 log-prob 在它自己的 observation 上计算（正确）
+- Group comparison 只能在 task/reset 对齐的 trajectory level 做（当前实现正是如此）
+- 不能把不同 observation 下的 chunks 当成同状态 group 来比较（当前实现不这样做）
+
+---
+
+## 7. Data Structures
+
+### 7.1 ChunkData（`rollout_buffer.py`）
+
+每个 model inference 产生一个 ChunkData：
+
+| 字段 | 类型 | 用途 |
+|---|---|---|
+| `obs_image` | Tensor [1,3,H,W] | 重算 log-prob 的视觉输入 |
+| `obs_proprio` | Tensor [1,D] or None | 重算 log-prob 的本体感知输入 |
+| `context` | Tensor [1,L,text_dim] | 文本 context embeddings |
+| `context_mask` | Tensor [1,L] | context mask |
+| `chain` | Tensor [K+1,H,D] | 完整 denoising 轨迹 |
+| `old_log_prob` | Tensor (scalar) | rollout 时旧策略的 block log-likelihood |
+| `block_size` | int | ratio 归一化因子。match 模式下为 `replan_steps × K`；slice 模式下为 `exec_horizon × K`；默认为 `H × K` |
+| `exec_horizon` | int or None | log_prob 截断的 action 步数。None 表示覆盖全部预测步 |
+| `action` | Tensor [H,D] | 最终 denoised action |
+| `chunk_rewards` | list[float] | 本 chunk 内每步的环境 reward |
+| `done` | bool | 本 chunk 内 episode 是否结束 |
+| `task_id` | str | 任务标识 |
+| `task_description` | str | 自然语言任务描述 |
+| `group_id` | str | group 标识，格式 `{suite}:{task}:update_{step}:batch_{idx}:reset_{idx}` |
+| `reset_id` | str | reset 标识 |
+| `initial_state_index` | int | 使用的初始状态索引 |
+| `trajectory_id` | str | 父 trajectory 标识 |
+| `chunk_index` | int | 在 trajectory 中的 chunk 序号 |
+| `env_step_start` | int | 本 chunk 起始环境步 |
+| `env_step_end` | int | 本 chunk 结束环境步 |
+| `rollout_seed` | int or None | 本 chunk 的采样 seed |
+| `rollout_time` | float | 相对 trajectory 开始的时间戳 |
+| `task_suite_name` | str | benchmark suite 名称 |
+| `reward_components` | dict | 命名 reward 分解 |
+| `advantage` | float | 由 advantages.py 填入 |
+
+### 7.2 TrajectoryData（`rollout_buffer.py`）
+
+| 字段 | 类型 | 用途 |
+|---|---|---|
+| `task_id` | str | 任务标识 |
+| `task_description` | str | 自然语言任务描述 |
+| `chunks` | list[ChunkData] | 有序 chunk 列表 |
+| `trajectory_reward` | float | Terminal reward（0 或 1） |
+| `success` | bool | 是否成功 |
+| `group_id` | str | group 标识 |
+| `reset_id` | str | reset 标识 |
+| `initial_state_index` | int | 初始状态索引 |
+| `trajectory_id` | str | 唯一 trajectory 标识 |
+| `rollout_seed` | int or None | 首个 chunk 的 seed |
+| `rollout_time` | float | 采集耗时（秒） |
+| `task_suite_name` | str | benchmark suite 名称 |
+| `reward_components` | dict | 命名 reward 分解 |
+| `trajectory_advantage` | float | trajectory-level advantage |
+
+### 7.3 Chain Storage
+
+Flow-GSPO 不能只存最终 action。必须存完整 denoising chain：
+
+$$A_t^0 \rightarrow A_t^{\tau_1} \rightarrow \cdots \rightarrow A_t^1$$
+
+因为训练时 `compute_logprob_from_chain` 沿整条 SDE path 重算 log-prob（带梯度），需要每一步的中间状态。shape 为 `[K+1, H, D]`。
+
+---
+
+## 8. Training Pipeline
+
+### 8.1 Main Loop
+
+`trainer.py:FastWAMRLTrainer.train()` 的完整流程：
+
+```
+for global_step in range(max_updates):
+    1. t_rollout = perf_counter()
+       _collect_rollout_buffer()
+         - 选择 task_batch_size 个 task
+         - 每个 task 从 _task_state_cursors 轮选 initial_state
+         - 每个 (task, reset) 采样 group_size 条 trajectory
+         - 每条 trajectory: env.reset(initial_state) → warm-up → SDE denoising loop
+         - 存入 RolloutBuffer
+       rollout_time = perf_counter() - t_rollout
+
+    2. assign_advantages()
+       - 按 group_id 分组
+       - 零方差过滤
+       - trajectory-level group normalization
+
+    3. compute_rollout_metrics()
+
+    4. t_optim = perf_counter()
+       for epoch in range(num_optimization_epochs):
+         compute_gspo_objective()
+           - 按 variant 选择 chunk-level 或 trajectory-level objective
+           - 内部通过 backward_fn=accelerator.backward 做 per-chunk / per-trajectory 梯度累积
+           - 对每个 chunk/trajectory 调用 compute_logprob_from_chain (带梯度)
+           - 计算 ratio, clipped surrogate, KL
+         clip_grad_norm + optimizer.step
+         - 累积本 epoch 的 metrics
+       optim_time = perf_counter() - t_optim
+       - 对所有 epoch 的 metrics 取平均
+
+    5. global_step += 1
+
+    6. log_metrics() (每 log_every 步，含 rollout_time_s 和 optim_time_s)
+    7. save_checkpoint() (每 save_every 步)
+```
+
+多 epoch 指标处理：当 `num_optimization_epochs > 1` 时，所有 epoch 的 grad_norm、clip_fraction、approx_kl、ratio 等指标累积后取平均，而非只保留最后一轮。
+
+注意：当前 trainer 中 `compute_gspo_objective()` 已经负责调用 `backward_fn` 完成梯度累积，因此外层 **不会** 再对 `result.loss` 额外调用一次 `accelerator.backward`。
+
+### 8.2 Group Sampling
+
+Group 构造为同一 task、同一 reset state 上的 $G$ 条 trajectory。具体实现：
+
+- 每个 task 维护 `_task_state_cursors[task_id]`，轮转选择 `initial_states` 列表中的不同初始状态
+- Group 内所有 trajectory 使用相同的 `initial_state`
+- `group_id` 包含完整信息：`{suite}:{task}:update_{step}:batch_{idx}:reset_{idx}`
+- 不跨 task 混组
+
+### 8.3 Collector Configuration
+
+`RolloutCollector` 根据 `rl.action_horizon` 和 `rl.exec_horizon` 配置：
+- `rl.action_horizon`：若非 null，覆盖传入模型的预测步数（方案 match）
+- `rl.exec_horizon`：若非 null，传入 SDE 采样函数，控制 log_prob 只覆盖前 N 个 action（方案 slice）
+
+执行步数（`replan_steps`）始终由 `EVALUATION.replan_steps` 控制，不受这两个配置影响。
+
+实现中加入以下硬约束，避免 rollout 与 objective 脱钩：
+- `action_horizon >= replan_steps`
+- 若 `exec_horizon != null`，则必须满足 `0 < exec_horizon <= action_horizon`
+- 若 `exec_horizon != null`，则必须满足 `exec_horizon == replan_steps`
+
+---
+
+## 9. Checkpoint & Resume
+
+### 9.1 保存内容
+
+每次 checkpoint 保存两部分：
+
+**Weights**（`checkpoints/weights/update_{step}.pt`）：
+- Model 权重（通过 `model.save_checkpoint`）
+
+**State**（`checkpoints/state/update_{step}/trainer_state.pt`）：
+```python
+{
+    "optimizer": optimizer.state_dict(),
+    "trainer_state": {
+        "global_step": int,
+        "task_cursor": int,
+        "task_state_cursors": {task_id: cursor},
+        "variant": str,
+        "weights_path": str,
+        "collector_sample_counters": {task_id: counter},
+        "rng_state": {
+            "cpu": torch.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "random": random.getstate(),
+            "cuda": torch.cuda.get_rng_state_all(),  # if available
+        },
+    },
 }
-\right)^{1/(\sum_t HK)}.
-$$
+```
 
-用途：
+### 9.2 Resume 流程
 
-- 检验“reward unit 与 ratio unit 完全统一”是否值得。
+设置 `rl.resume=<state_dir>` 后，trainer 初始化时按以下顺序恢复：
 
-风险：
-
-- 方差更高；
-- clipping 更容易过强；
-- 单个坏 chunk 会污染整条 trajectory ratio。
-
----
-
-## 6. Final Theoretical Conclusion on Observation Mismatch
-
-必须明确：
-
-- `observation mismatch` 不会破坏 policy gradient；
-- 它破坏的是伪造的 `same-state group comparison`。
-
-原因是：
-
-$$
-\frac{p_\theta(\tau)}{p_{\theta_{\text{old}}}(\tau)}
-=
-\prod_t
-\frac{\pi_\theta(A_t\mid s_t)}
-{\pi_{\theta_{\text{old}}}(A_t\mid s_t)},
-$$
-
-环境转移项会抵消。
-
-因此：
-
-- 每个 chunk 的 log-prob 应在它自己的 observation 上计算；
-- group comparison 只能在 task/reset 对齐的 trajectory level 做；
-- 不能把不同 observation 下的 chunks 当成同状态 group 来比较。
+1. **Model weights**：先加载 init checkpoint（`cfg.ckpt`），然后用 resume state 中的 `weights_path` 覆盖。若 `weights_path` 无效，优先在 `resume_dir.parent.parent / "weights" / update_{step}.pt` 下按 step-tag fallback，再尝试当前 run 的 `weights_dir`。
+2. **Optimizer state**：`optimizer.load_state_dict(payload["optimizer"])` 后，显式将 optimizer state tensors 迁移到 model device（兼容 `map_location="cpu"` 的 checkpoint 恢复）
+3. **Trainer state**：global_step, task_cursor, task_state_cursors
+4. **RNG state**：恢复 CPU / NumPy / Python random / CUDA 四路全量随机状态（参照 RLinf 模式）
+5. **Collector sample counters**：缓存到 `_saved_sample_counters`，在对应 task 的 collector 惰性创建时恢复，保证 seed 序列连续而非从头重放
 
 ---
 
-## 7. Current FastWAM RL Code Status
+## 10. Monitoring
 
-当前仓库内已经落下的 RL 相关代码主要在：
+### 10.1 Rollout Metrics（`metrics.py:compute_rollout_metrics`）
 
-- `src/fastwam/rl/rollout_buffer.py`
-- `src/fastwam/rl/advantages.py`
-- `src/fastwam/rl/rollout_collector.py`
-- `src/fastwam/rl/algorithms.py`
-- `src/fastwam/rl/objectives.py`
-- `src/fastwam/rl/metrics.py`
-- `src/fastwam/rl/metric_logger.py`
-- `src/fastwam/rl/trainer.py`
-- `configs/train_rl_libero.yaml`
-- `scripts/train_rl.py`
+| 指标 | 含义 |
+|---|---|
+| `num_trajectories` | 本 batch trajectory 数量 |
+| `num_chunks` | 本 batch chunk 数量 |
+| `success_rate` | 成功率（SDE exploration） |
+| `trajectory_reward_mean/std` | trajectory reward 统计 |
+| `trajectory_advantage_mean/std` | trajectory advantage 统计 |
+| `chunk_advantage_mean/std` | chunk advantage 统计 |
+| `chunk_return_mean/std` | chunk 内 reward 总和统计 |
+| `chunks_per_trajectory_mean/max` | 每 trajectory chunk 数统计 |
+| `informative_group_fraction` | 非零方差 group 占比 |
+| `group_reward_std_mean` | group 内 reward std 的均值 |
+| `per_task/{task_id}/success_rate` | 每个 task 的成功率 |
+| `per_task/{task_id}/num_trajectories` | 每个 task 的 trajectory 数 |
 
-这些文件的当前职责为：
+### 10.2 Training Metrics（`objectives.py` + `trainer.py`）
 
-- `rollout_buffer.py`: 轨迹/块级数据结构；
-- `advantages.py`: block / trajectory advantage assignment；
-- `rollout_collector.py`: LIBERO rollout + SDE sampling + denoising chain 存储；
-- `algorithms.py`: 三种 ablation 的配置注册；
-- `objectives.py`: chunk-level 与 trajectory-level objective；
-- `metrics.py`: rollout / optimization 指标；
-- `metric_logger.py`: `wandb/tensorboard` 后端；
-- `trainer.py`: 单进程 RL 主循环；
-- `train_rl_libero.yaml`: Hydra 训练配置；
-- `train_rl.py`: RL 训练入口。
+| 指标 | 含义 |
+|---|---|
+| `num_objective_terms` | 参与 objective 计算的 chunk/trajectory 数 |
+| `policy_objective` | clipped surrogate 均值（多 epoch 平均） |
+| `approx_kl` | $s - 1 - \log s$ 的均值（多 epoch 平均） |
+| `clip_fraction` | ratio 超出 clip 范围的比例（多 epoch 平均） |
+| `clip_branch_active_fraction` | 真正进入 clipped surrogate 分支的比例（多 epoch 平均） |
+| `ratio_mean/min/max` | ratio 统计（多 epoch 平均） |
+| `log_ratio_mean` | log ratio 均值（多 epoch 平均） |
+| `grad_norm` | 梯度范数（多 epoch 平均） |
+| `rollout_time_s` | rollout 采集耗时（秒） |
+| `optim_time_s` | 优化耗时（秒） |
 
-注意：
+### 10.3 Logging Backend & Wandb
 
-- 当前实现是 `single-process rollout trainer`；
-- 结构已经按后续并行 rollout 可扩展方向拆开；
-- 还不是 `RLinf` 风格的多 worker / async scheduler 系统。
+通过 `rl.logging.backends` 配置，支持 `wandb` 和 `tensorboard`。也可直接设置 `wandb.enabled=true` 自动启用 wandb（`metric_logger.py:40-41`）。
 
----
+Wandb 初始化参数来自顶层 `wandb` 配置（`metric_logger.py:64-77`）：
 
-## 8. Rollout Data: What Must Be Stored
+| 字段 | 默认值 | 用途 |
+|---|---|---|
+| `wandb.enabled` | `false` | 总开关 |
+| `wandb.workspace` | `null` | entity（用户/组织名） |
+| `wandb.project` | `fast-wam-rl` | 项目名 |
+| `wandb.name` | `flow-gspo-${rl.variant}` | run 名称 |
+| `wandb.group` | `${EVALUATION.task_suite_name}` | 分组（按 suite） |
+| `wandb.mode` | `online` | `online` / `offline` / `disabled` |
 
-这是集群上继续工作的关键上下文。
+### 10.4 Complete Experiment Commands
 
-### 8.1 Minimum chunk-level storage
+四个实验，每个需在 4 个 LIBERO suite 上分别运行。以下以 `libero_spatial` 为例：
 
-每个 action chunk 至少要存：
+```bash
+CKPT=<pretrained.pt>
 
-- `obs_image`
-- `obs_proprio`
-- `context`
-- `context_mask`
-- `chain`
-- `old_log_prob`
-- `block_size`
-- `action`
-- `chunk_rewards`
-- `done`
-- `task_id`
-- `task_description`
-- `advantage`
+# Exp-2a: traj_chunk + match (predict=exec=10)
+python scripts/train_rl.py \
+    EVALUATION.task_suite_name=libero_spatial \
+    rl.variant=traj_chunk rl.action_horizon=10 rl.exec_horizon=null \
+    wandb.enabled=true wandb.name=exp2a-match \
+    ckpt=$CKPT
 
-这些字段的意义分别是：
+# Exp-2b: traj_chunk + slice (predict=32, log_prob 截断到 10)
+python scripts/train_rl.py \
+    EVALUATION.task_suite_name=libero_spatial \
+    rl.variant=traj_chunk rl.action_horizon=null rl.exec_horizon=10 \
+    wandb.enabled=true wandb.name=exp2b-slice \
+    ckpt=$CKPT
 
-- `obs_* / context*`: 重新计算当前策略 log-prob 所需；
-- `chain`: 完整去噪路径，用于 `compute_logprob_from_chain`；
-- `old_log_prob`: rollout 时旧策略的 block likelihood；
-- `block_size`: 做 $(HK)^{-1}$ 归一化；
-- `chunk_rewards`: `Exp-1` 所需的 block reward；
-- `task_id`: trajectory group normalization 所需；
-- `advantage`: assignment 之后供优化使用。
+# Exp-3a: traj_traj + match (predict=exec=10)
+python scripts/train_rl.py \
+    EVALUATION.task_suite_name=libero_spatial \
+    rl.variant=traj_traj rl.action_horizon=10 rl.exec_horizon=null \
+    wandb.enabled=true wandb.name=exp3a-match \
+    ckpt=$CKPT
 
-### 8.2 Minimum trajectory-level storage
+# Exp-3b: traj_traj + slice (predict=32, log_prob 截断到 10)
+python scripts/train_rl.py \
+    EVALUATION.task_suite_name=libero_spatial \
+    rl.variant=traj_traj rl.action_horizon=null rl.exec_horizon=10 \
+    wandb.enabled=true wandb.name=exp3b-slice \
+    ckpt=$CKPT
+```
 
-每条 trajectory 至少要存：
+换 suite 时改 `EVALUATION.task_suite_name` 为 `libero_object` / `libero_goal` / `libero_10`（Long）。
 
-- `task_id`
-- `task_description`
-- `chunks`
-- `trajectory_reward`
-- `success`
-- `trajectory_advantage`
+### 10.5 Final Evaluation
 
-### 8.3 Strongly recommended extra fields
+训练中不进行正式评估。最终 benchmark 评估使用 `eval_libero_single.py`，每个 task 跑 50 trials：
 
-后续为了更稳健，建议补充：
+```bash
+# 对每个 suite 的 10 个 task 分别评估
+for TASK_ID in $(seq 0 9); do
+    python experiments/libero/eval_libero_single.py \
+        ckpt=<rl_checkpoint.pt> \
+        EVALUATION.task_suite_name=libero_spatial \
+        EVALUATION.task_id=$TASK_ID \
+        EVALUATION.num_trials=50
+done
+```
 
-- `reset_id`
-- `initial_state_index`
-- `trajectory_id`
-- `chunk_index`
-- `env_step_start`
-- `env_step_end`
-- `seed`
-- `rollout_time`
-- `task_suite_name`
-- `reward_components`
-
-其中 `reward_components` 尤其重要，因为后续可能从纯 terminal reward 扩展到：
-
-- success reward
-- progress reward
-- stage reward
-- alignment reward
-- safety penalty
-
-若不单独存，会影响实验可解释性。
-
-### 8.4 Why chain storage is non-negotiable
-
-对 Flow-GSPO，不能只存最终 action。
-
-必须存：
-
-$$
-A_t^0 \rightarrow A_t^{\tau_1} \rightarrow \cdots \rightarrow A_t^1
-$$
-
-的完整 denoising chain，因为新策略的 block likelihood 是沿整条 SDE path 重算的，而不是只依赖最终 denoised action。
+汇总 suite-level success rate，对比 FastWAM BC baseline（Spatial 98.2 / Object 100.0 / Goal 97.0 / Long 95.2）。
 
 ---
 
-## 9. Recommended Training Loop
+## 11. Code Structure
 
-推荐流程固定为：
+```
+src/fastwam/rl/
+├── rollout_buffer.py       # ChunkData, TrajectoryData, RolloutBuffer
+├── rollout_collector.py    # RolloutCollector: LIBERO env + SDE sampling + chain storage
+├── algorithms.py           # FlowGSPOVariant registry: traj_chunk, traj_traj
+├── advantages.py           # trajectory advantage: uniform / temporal_decay
+├── objectives.py           # chunk-level & trajectory-level GSPO objective
+├── metrics.py              # rollout metrics computation
+├── metric_logger.py        # wandb/tensorboard backend
+└── trainer.py              # FastWAMRLTrainer: single-process RL main loop
 
-1. 选择 task batch；
-2. 对每个 task 采样 `group_size=G` 条 trajectory；
-3. 存入 `RolloutBuffer`；
-4. 依据 variant 做 advantage assignment；
-5. 依据 variant 做 ratio aggregation；
-6. 计算 clipped objective + KL regularization；
-7. 记录 rollout 和训练指标；
-8. checkpoint；
-9. 进入下一 update。
+src/fastwam/models/wan22/
+├── fastwam.py              # infer_action_with_logprob, compute_logprob_from_chain, build_action_video_kv_cache
+├── schedulers/
+│   └── scheduler_continuous.py  # step_sde_with_logprob (SDE drift + log-prob)
+├── action_dit.py           # ActionDiT (action_expert)
+└── mot.py                  # MoT (Mixture-of-Transformers)
 
-这个循环中，`collector` 不应知道当前跑的是哪个实验。
+configs/train_rl_libero.yaml  # Hydra RL 训练配置
+scripts/train_rl.py           # RL 训练入口
+```
 
-只有以下两层知道 variant：
+当前为 single-process rollout trainer。`Accelerator` 仅用于 mixed precision 和 gradient 管理，`num_processes` 必须为 1。
 
-- `advantage assignment`
-- `objective / ratio aggregation`
+`fastwam.py` 额外定义了 `ActionVideoKVCacheBundle` 类型。`compute_logprob_from_chain()` 的 `video_kv_cache` 参数现在只接受：
 
----
+- `None`
+- `build_action_video_kv_cache()` 返回的完整 bundle
 
-## 10. Efficient Inference and Rollout Infrastructure
-
-### 10.1 Basic efficiency principle
-
-真正昂贵的部分是：
-
-- environment interaction；
-- video-side encoding；
-- repeated action denoising；
-- reward computation。
-
-因此工程上必须避免无意义重复。
-
-### 10.2 Immediate efficiency decisions
-
-当前最合理的策略是：
-
-- 冻结 `video DiT`；
-- rollout 时每个 observation 只做一次 video prefill；
-- action ratio 重算尽量只走 action-side forward；
-- 维持短期 on-policy buffer；
-- group 按 task/reset 构造，不跨任务乱拼。
-
-### 10.3 Video KV cache reuse
-
-`FastWAM` 当前已经有：
-
-- rollout-time `infer_action_with_logprob`
-- update-time `compute_logprob_from_chain`
-
-二者都依赖 video-side prefill / cache。
-
-后续优化重点：
-
-- rollout 阶段复用 observation 对应的 video KV cache；
-- update 阶段减少重复构图；
-- 尽量让 ratio 重算只重新前向 action branch。
-
-### 10.4 Group sampling strategy
-
-优先级如下：
-
-1. 同一个 reset state 上采样多条 trajectory；
-2. 若做不到，则同 task / 同分布 reset；
-3. 不要跨 task 混组。
-
-### 10.5 Parallelism roadmap
-
-短期：
-
-- 保持单进程 rollout；
-- 先验证三种 ablation 的正确性。
-
-中期：
-
-- 每个 task 一个 env worker；
-- 将 rollout collector 从 trainer 中拆出；
-- 用进程级并行采样不同 task groups。
-
-长期：
-
-- 向 `RLinf` 风格靠拢；
-- 独立 actor / rollout / env / reward worker；
-- 支持 async rollout 与 weight sync。
+不再接受缺少 metadata 的 raw KV-cache list，以避免静默构造出错误的 attention mask。
 
 ---
 
-## 11. Monitoring and Logging Requirements
-
-### 11.1 Minimum acceptable monitoring
-
-必须记录：
-
-- `rollout/success_rate`
-- `rollout/trajectory_reward_mean`
-- `rollout/trajectory_reward_std`
-- `rollout/chunk_return_mean`
-- `rollout/chunk_return_std`
-- `rollout/informative_group_fraction`
-- `rollout/group_reward_std_mean`
-- `train/policy_objective`
-- `train/approx_kl`
-- `train/clip_fraction`
-- `train/ratio_mean`
-- `train/ratio_min`
-- `train/ratio_max`
-- `train/log_ratio_mean`
-- `train/grad_norm`
-
-若跑 `Exp-3`，还应特别关注：
-
-- `chunks_per_trajectory_mean`
-- trajectory-level clip fraction 是否快速升高；
-- ratio 是否更快塌缩到 clipping 边界。
-
-### 11.2 W&B configuration
-
-当前仓库的训练配置已支持 `wandb` 风格字段：
-
-- `wandb.enabled`
-- `wandb.workspace`
-- `wandb.project`
-- `wandb.name`
-- `wandb.group`
-- `wandb.mode`
-
-RL trainer 里另外加了一层 `rl.logging.backends`，可选：
-
-- `wandb`
-- `tensorboard`
-
-推荐默认行为：
-
-- 集群联机训练：`wandb`
-- 无外网或调试：`tensorboard`
-
-### 11.3 What to log as artifacts
-
-除 scalar 指标外，建议后续增加：
-
-- sampled rollout video
-- per-task success table
-- checkpoint metadata
-- config snapshot
-- variant name
-- reward breakdown histogram
-
----
-
-## 12. External Repositories: What to Borrow
-
-本项目后续仍会继续借鉴：
-
-- `repo/RLinf`
-- `repo/ReinFlow`
-- `repo/flow_grpo`
-
-下面是当前最重要的借鉴点。
-
-### 12.1 Borrowing from RLinf
-
-最值得借鉴的不是具体算法，而是 infra 结构。
-
-关键文件：
-
-- `RLinf/rlinf/runners/embodied_runner.py`
-- `RLinf/rlinf/utils/metric_logger.py`
-- `RLinf/rlinf/utils/metric_utils.py`
-- `RLinf/rlinf/utils/distributed.py`
-
-应借鉴的核心点：
-
-1. `runner / worker / logger` 解耦
-2. rollout metrics 聚合与分 rank 日志
-3. 多后端 logger 抽象
-4. async logging / async worker 的组织方式
-5. 将时间统计、rollout 指标、训练指标分层汇总
-
-对本项目的直接启发：
-
-- `FastWAMRLTrainer` 现在只是单进程版本；
-- 后续应把 `collector`、`reward`、`actor update` 的角色继续拆开；
-- 尤其要借鉴 `MetricLogger` + `rollout metrics aggregation` 的思路。
-
-不应直接照搬的部分：
-
-- `RLinf` 偏通用大规模 RL 系统；
-- 当前 FastWAM 阶段不需要一开始就上完整多 worker scheduler；
-- 先验证算法，再逐步扩展 infra。
-
-### 12.2 Borrowing from ReinFlow
-
-关键文件：
-
-- `ReinFlow/script/run.py`
-- `ReinFlow/agent/finetune/dppo/train_ppo_diffusion_agent.py`
-
-应借鉴的核心点：
-
-1. 基于 config 的统一实验入口
-2. rollout 数据和 update 逻辑的清晰分离
-3. diffusion / flow 类策略中保存 chain 的必要性
-4. 训练时对 value/logprob 重算的 batch 化处理
-5. reward / success / episode summary 的清晰统计
-
-`train_ppo_diffusion_agent.py` 对本项目特别有用，因为它体现了：
-
-- 如何把环境 rollout 收集成固定结构；
-- 如何存 `chains_trajs`；
-- 如何在 update 阶段分 batch 计算 logprob / value；
-- 如何组织 eval/train 切换。
-
-对本项目的直接启发：
-
-- `FastWAM` 应坚持 `rollout buffer` 的显式结构化；
-- 后续若 trajectory 很长，ratio 重算也应支持 batch split；
-- 训练 summary 需要区分 chunk 粒度与 episode 粒度。
-
-### 12.3 Borrowing from flow_grpo
-
-关键文件：
-
-- `flow_grpo/scripts/train_wan2_1.py`
-- `flow_grpo/flow_grpo/stat_tracking.py`
-- `flow_grpo/flow_grpo/diffusers_patch/*_with_logprob.py`
-- `flow_grpo/flow_grpo/rewards.py`
-
-应借鉴的核心点：
-
-1. `pipeline_with_logprob` 的实现方式
-2. SDE step with logprob 的工程写法
-3. `Accelerator + wandb` 的训练日志接入
-4. group-based reward normalization / stat tracking
-5. reward function 与 sampling process 的解耦
-
-对本项目最直接的帮助有两点：
-
-第一，`with_logprob` 系列 patch 展示了如何把生成 pipeline 改造成：
-
-- 返回 sample；
-- 返回 full latent / chain；
-- 返回 logprob。
-
-这和 `FastWAM` 里 `infer_action_with_logprob` / `compute_logprob_from_chain` 的思路高度一致。
-
-第二，`PerPromptStatTracker` 明确体现了：
-
-- group-based normalization 是独立模块；
-- group 的统计状态可以显式维护；
-- informative group 的比例本身值得监控。
-
-不应直接照搬的部分：
-
-- `flow_grpo` 的 grouping 单位是 prompt/image generation；
-- `FastWAM` 这里的 grouping 单位是 `task/reset/trajectory`；
-- 不能机械套用 prompt-based grouping。
-
----
-
-## 13. Recommended Engineering Principles Going Forward
-
-### 13.1 Keep collector algorithm-agnostic
-
-`rollout_collector.py` 不应该知道当前是：
-
-- `Exp-1`
-- `Exp-2`
-- `Exp-3`
-
-它只负责：
-
-- rollout；
-- 调 action inference；
-- 存 chain / old logprob / rewards / task ids。
-
-### 13.2 Keep objective switch minimal
-
-实验切换只应改：
-
-- `advantage_mode`
-- `ratio_mode`
-
-不要让 variant 决定：
-
-- collector 行为；
-- env API；
-- logging 接口；
-- checkpoint 格式。
-
-### 13.3 Treat reward as first-class structure
-
-后续若加入：
-
-- progress reward
-- stage reward
-- VLM process reward
-- alignment reward
-
-必须将它们结构化保存，而不是只存一个最终浮点数。
-
-### 13.4 Prefer resumable configs over ad hoc scripts
-
-集群运行时，一切都应优先通过配置字段表达：
-
-- variant
-- task suite
-- task ids
-- trainable scope
-- reward mode
-- logging backend
-- resume checkpoint
-
-不应靠手改脚本切换实验。
-
----
-
-## 14. Immediate TODOs for the Cluster Workspace
-
-另一工作空间接手后，建议按以下顺序继续：
-
-1. 确认 `FastWAM`、`RLinf`、`ReinFlow`、`flow_grpo` 都已在集群上拉取。
-2. 以本文件和 `src/fastwam/rl/*` 为主上下文，检查当前 RL trainer 是否满足运行环境依赖。
-3. 先跑最小单任务 smoke test：
-   - `rl.variant=block`
-   - `task_batch_size=1`
-   - `group_size=2`
-   - `max_updates` 很小
-4. 再跑三种实验的最小版：
-   - `block`
-   - `traj_chunk`
-   - `traj_traj`
-5. 观察 rollout metrics 与 ratio metrics 是否合理。
-6. 若单进程版本稳定，再开始考虑并行 rollout。
-
----
-
-## 15. Final Operating Conclusion
-
-当前项目的正确方向不是“只实现一个主方法”，而是：
-
-- 以 `FastWAM` 冻结的 world representation 为基础；
-- 用统一 infra 支持三种 `Flow-GSPO` 消融；
-- 用 `chain-aware flow likelihood` 做 ratio；
-- 用 task/reset 对齐的 grouping 做 advantage；
-- 用干净的 rollout/logging/checkpoint 抽象，为后续集群扩展保留空间。
-
-如果另一个工作空间只读一个文件来理解项目，应该优先读本文件，其次再读：
-
-- `src/fastwam/rl/trainer.py`
-- `src/fastwam/rl/objectives.py`
-- `src/fastwam/rl/rollout_collector.py`
-- `configs/train_rl_libero.yaml`
+## 12. Key Configuration
+
+```yaml
+rl:
+  variant: traj_chunk          # traj_chunk 或 traj_traj
+  trainable_scope: action_expert_only  # action_expert_only / action_expert_and_mot / full
+  max_updates: 200             # 对齐 OmniVLA-RL
+  group_size: 8                # 每 group 采样的 trajectory 数
+  task_batch_size: 1           # 每 update 的 task 数
+  num_optimization_epochs: 1
+  clip_range: 0.2              # PPO clipping epsilon
+  kl_coef: 0.01                # KL 正则系数 beta
+  learning_rate: 1e-5
+  weight_decay: 0.01           # 对齐 OmniVLA-RL
+  max_grad_norm: 1.0
+  sigma_max: 0.1               # SDE noise upper bound
+  num_inference_steps: 10      # denoising steps K
+
+  # Action chunk 消融维度
+  action_horizon: null         # null=默认32, int=覆盖预测步数（match 方案）
+  exec_horizon: null           # null=覆盖全部, int=log_prob 只算前N步（slice 方案）
+
+  trajectory_assignment: uniform  # uniform / temporal_decay
+  advantage_gamma: 0.99
+  log_every: 1
+  save_every: 10
+  resume: null
+```
