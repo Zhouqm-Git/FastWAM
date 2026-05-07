@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 def _extract_sim_state(obs: dict) -> np.ndarray:
     """Build proprioceptive state from LIBERO observation."""
-    from libero.libero.utils.utils import quat2axisangle
+    from experiments.libero.libero_utils import quat2axisangle
 
     state = np.concatenate(
         (
@@ -246,9 +246,11 @@ class RolloutCollector:
 
     def _get_libero_image(self, obs: dict) -> dict[str, np.ndarray]:
         """Extract images from LIBERO observation."""
-        imgs = {"image": obs["image"]}
-        if "wrist_image" in obs:
-            imgs["wrist_image"] = obs["wrist_image"]
+        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+        imgs = {"image": img}
+        if "robot0_eye_in_hand_image" in obs:
+            wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+            imgs["wrist_image"] = wrist_img
         return imgs
 
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
@@ -267,7 +269,7 @@ class RolloutCollector:
 
         Matches eval_libero_single.py behavior.
         """
-        from libero.libero.utils.utils import invert_gripper_action
+        from experiments.libero.libero_utils import invert_gripper_action
 
         action = self._denormalize_action(action)[0]  # [T, D]
 

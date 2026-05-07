@@ -7,9 +7,15 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+# Ensure project-root-only packages (e.g. experiments/) are importable.
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import torch
@@ -483,9 +489,11 @@ class FastWAMRLTrainer:
             # Accumulate metrics across epochs, then average
             epoch_accum: dict[str, list[float]] = {}
             for _ in range(self.num_optimization_epochs):
+                self.optimizer.zero_grad(set_to_none=True)
                 result = compute_gspo_objective(
                     model=unwrapped_model,
                     buffer=rollout_buffer,
+                    backward_fn=self.accelerator.backward,
                     variant=self.variant.name,
                     clip_range=self.clip_range,
                     kl_coef=self.kl_coef,
@@ -497,9 +505,9 @@ class FastWAMRLTrainer:
                         else float(self.cfg.EVALUATION.sigma_shift)
                     ),
                 )
-                self.optimizer.zero_grad(set_to_none=True)
                 if result.metrics["num_objective_terms"] > 0:
-                    self.accelerator.backward(result.loss)
+                    # Gradients already accumulated via per-chunk/traj
+                    # backward_fn calls inside compute_gspo_objective.
                     grad_norm = self.accelerator.clip_grad_norm_(
                         [p for p in self.model.parameters() if p.requires_grad],
                         self.max_grad_norm,
